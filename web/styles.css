@@ -2,6 +2,9 @@
    Claude 对话管理器 — design tokens & base styles
    =================================================================== */
 
+/* Default 150% zoom — matches desktop-app density (Ctrl+ equivalent) */
+html { zoom: 1.5; }
+
 /* Active pulse dot (used on conv cards + list rows) */
 .active-dot {
   display: inline-block;
