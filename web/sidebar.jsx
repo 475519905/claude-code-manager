@@ -18,7 +18,7 @@ const Sidebar = ({ view, setView, selectedProject, setSelectedProject, selectedT
     <aside className="sidebar">
       <div className="brand">
         <img className="brand-mark" src="/icon.png" alt="" draggable="false"/>
-        <div className="brand-name"><span className="zh">对话管理器</span></div>
+        <div className="brand-name"><span className="zh">Claude Manager</span></div>
       </div>
 
       <button className="new-chat-btn" onClick={() => window.location.reload()} title="重新扫描 ~/.claude/projects/">

@@ -559,7 +559,7 @@ def _wait_for_server(timeout: float = 5.0) -> bool:
 
 
 def main():
-    print("Claude Conversation Manager")
+    print("Claude Manager")
     print(f"Projects dir: {PROJECTS_DIR}")
     print(f"Serving on http://{HOST}:{PORT}")
 
@@ -573,7 +573,7 @@ def main():
         try:
             import webview  # type: ignore
             webview.create_window(
-                "Claude 对话管理器",
+                "Claude Manager",
                 f"http://{HOST}:{PORT}",
                 width=1280, height=840,
                 min_size=(960, 640),
