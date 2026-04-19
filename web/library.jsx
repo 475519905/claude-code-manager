@@ -73,6 +73,19 @@ const LibraryView = ({ data, onOpen, onPreview, selected, setSelected, viewMode,
 
         <div className="toolbar-spacer"/>
 
+        {(() => {
+          const visible = filtered.map(c => c.id);
+          const allChecked = visible.length > 0 && visible.every(id => selected.includes(id));
+          return (
+            <button className="chip-btn" onClick={() => {
+              if (allChecked) setSelected(prev => prev.filter(id => !visible.includes(id)));
+              else setSelected(prev => Array.from(new Set([...prev, ...visible])));
+            }} title={allChecked ? '取消全选' : '选择当前视图所有'}>
+              <Icon name="check" size={11}/> {allChecked ? '取消全选' : `全选 (${visible.length})`}
+            </button>
+          );
+        })()}
+
         <div className="seg" style={{background: 'var(--bg-sunk)', borderRadius: 'var(--radius-sm)', padding: 2, display: 'flex', fontSize: 12}}>
           <button
             onClick={() => setSortBy('updated')}
@@ -207,7 +220,12 @@ const ConvCard = ({ conv, projects, tags, selected, bulkMode, onToggleSelect, on
         role="checkbox"
         aria-checked={selected}
         title="选择"
-        onClick={(e) => { e.stopPropagation(); onToggleSelect(); }}
+        onMouseDownCapture={(e) => {
+          e.stopPropagation();
+          e.preventDefault();
+          onToggleSelect();
+        }}
+        onClick={(e) => { e.stopPropagation(); e.preventDefault(); }}
       >
         {selected && <Icon name="check" size={12} stroke={3}/>}
       </div>
