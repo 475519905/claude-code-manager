@@ -1,21 +1,10 @@
 // Sidebar component
 const Sidebar = ({ view, setView, selectedProject, setSelectedProject, selectedTag, setSelectedTag, data, counts }) => {
   const [account, setAccount] = React.useState(null);
-  const [profile, setProfile] = React.useState(() => {
-    try { return JSON.parse(localStorage.getItem('cm.profile') || '{}'); } catch { return {}; }
-  });
+  const profile = { name: '林知远', email: 'zhihyuan.lin@mail.com' };
   React.useEffect(() => {
     fetch('/api/account').then(r => r.json()).then(setAccount).catch(() => {});
   }, []);
-  const editProfile = () => {
-    const name = prompt('显示名称 (留空清除):', profile.name || '');
-    if (name === null) return;
-    const email = prompt('邮箱 (可选):', profile.email || '');
-    if (email === null) return;
-    const next = { name: name.trim(), email: email.trim() };
-    setProfile(next);
-    localStorage.setItem('cm.profile', JSON.stringify(next));
-  };
   const navItems = [
     { id: 'all',     label: '所有对话', icon: 'message', count: counts.all },
     { id: 'pinned',  label: '置顶',     icon: 'pin',     count: counts.pinned },
@@ -106,23 +95,16 @@ const Sidebar = ({ view, setView, selectedProject, setSelectedProject, selectedT
       </div>
 
       <div className="sidebar-footer">
-        <div className="avatar">{(profile.name || 'C').trim().charAt(0).toUpperCase()}</div>
+        <div className="avatar">{profile.name.charAt(0)}</div>
         <div className="user-meta">
-          <div className="user-name" title={profile.email || ''}>
-            {profile.name || '未设置名称'}
-          </div>
+          <div className="user-name" title={profile.email}>{profile.name}</div>
           <div className="user-plan">
             {account && account.ok
               ? `${account.plan}${account.tier ? ' · ' + account.tier : ''}`
               : `${data.conversations.length} 会话`}
           </div>
-          {profile.email && (
-            <div className="user-email" title={profile.email}>{profile.email}</div>
-          )}
+          <div className="user-email" title={profile.email}>{profile.email}</div>
         </div>
-        <button className="icon-btn" title="编辑显示名 / 邮箱" onClick={editProfile}>
-          <Icon name="settings" size={13}/>
-        </button>
       </div>
     </aside>
   );
