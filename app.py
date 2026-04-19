@@ -18,6 +18,7 @@ from flask import Flask, Response, abort, jsonify, request, send_file, send_from
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
 HOST = "127.0.0.1"
 PORT = 8765
+ACTIVE_WINDOW_SECS = 180  # file mtime within this window → session is "active"
 
 
 def _resource_dir() -> Path:
@@ -136,6 +137,7 @@ def _summarize_session(project: str, path: Path) -> dict:
     except OSError:
         size, mtime = 0, 0
 
+    active = (time.time() - mtime) < ACTIVE_WINDOW_SECS if mtime else False
     return {
         "project": project,
         "sid": sid,
@@ -149,6 +151,7 @@ def _summarize_session(project: str, path: Path) -> dict:
         "assistantCount": assistant_count,
         "summary": summary or first_user_text,
         "preview": first_user_text,
+        "active": active,
     }
 
 
@@ -348,6 +351,26 @@ def api_resume():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
     return jsonify({"ok": True, "cwd": cwd})
+
+
+@app.route("/api/active")
+def api_active():
+    """Lightweight: return just the ids of sessions with recent mtime."""
+    if not PROJECTS_DIR.exists():
+        return jsonify({"active": []})
+    now = time.time()
+    active = []
+    for proj_dir in PROJECTS_DIR.iterdir():
+        if not proj_dir.is_dir():
+            continue
+        for f in proj_dir.glob("*.jsonl"):
+            try:
+                mtime = f.stat().st_mtime
+            except OSError:
+                continue
+            if (now - mtime) < ACTIVE_WINDOW_SECS:
+                active.append({"project": proj_dir.name, "sid": f.stem, "mtime": mtime})
+    return jsonify({"active": active, "windowSecs": ACTIVE_WINDOW_SECS})
 
 
 @app.route("/api/stats")

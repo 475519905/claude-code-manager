@@ -114,6 +114,7 @@
       size: s.size,
       userCount: s.userCount || 0,
       assistantCount: s.assistantCount || 0,
+      active: !!s.active,
     };
   });
 

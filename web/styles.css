@@ -2,6 +2,34 @@
    Claude 对话管理器 — design tokens & base styles
    =================================================================== */
 
+/* Active pulse dot (used on conv cards + list rows) */
+.active-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: oklch(70% 0.17 145);
+  box-shadow: 0 0 0 0 oklch(70% 0.17 145 / 0.6);
+  animation: active-pulse 1.6s ease-in-out infinite;
+  vertical-align: middle;
+}
+@keyframes active-pulse {
+  0%   { box-shadow: 0 0 0 0 oklch(70% 0.17 145 / 0.55); }
+  70%  { box-shadow: 0 0 0 6px oklch(70% 0.17 145 / 0); }
+  100% { box-shadow: 0 0 0 0 oklch(70% 0.17 145 / 0); }
+}
+.conv-card.is-active {
+  border-color: oklch(70% 0.15 145 / 0.5);
+}
+.conv-card.is-active::before {
+  content: "";
+  position: absolute;
+  left: 0; top: 0; bottom: 0;
+  width: 3px;
+  border-radius: 3px 0 0 3px;
+  background: oklch(70% 0.17 145);
+}
+
 :root {
   /* Neutrals — warm whites, ink grays */
   --bg:            oklch(98.5% 0.004 85);

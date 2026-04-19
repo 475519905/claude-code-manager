@@ -61,6 +61,32 @@ const App = () => {
     return () => window.removeEventListener('mouseup', up);
   }, []);
 
+  // Poll active-sessions every 20s; update conversations' active flag in place
+  useEffect(() => {
+    let stopped = false;
+    const tick = async () => {
+      try {
+        const r = await fetch('/api/active');
+        const d = await r.json();
+        if (stopped) return;
+        const activeSet = new Set((d.active || []).map(a => a.project + '|' + a.sid));
+        setData(prev => {
+          let changed = false;
+          const next = prev.conversations.map(c => {
+            const isActive = activeSet.has(c.id);
+            if (isActive === c.active) return c;
+            changed = true;
+            return { ...c, active: isActive };
+          });
+          return changed ? { ...prev, conversations: next } : prev;
+        });
+      } catch {}
+    };
+    tick();
+    const id = setInterval(tick, 20_000);
+    return () => { stopped = true; clearInterval(id); };
+  }, []);
+
   const handleOpenConv = (id) => {
     scrollRef.current = window.scrollY;
     setOpenConvId(id);

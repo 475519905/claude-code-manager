@@ -156,6 +156,7 @@ const LibraryView = ({ data, onOpen, onPreview, selected, setSelected, viewMode,
               </div>
               <div className="title-cell">
                 <div className="row-title">
+                  {c.active && <span className="active-dot" title="正在活动" style={{marginRight: 6, verticalAlign: 1}}/>}
                   {c.pinned && <Icon name="pin" size={10} style={{color: 'var(--accent)', marginRight: 6, verticalAlign: -1}}/>}
                   {c.title}
                 </div>
@@ -205,7 +206,7 @@ const ConvCard = ({ conv, projects, tags, selected, bulkMode, onToggleSelect, on
 
   return (
     <div
-      className={`conv-card ${selected ? 'selected' : ''}`}
+      className={`conv-card ${selected ? 'selected' : ''} ${conv.active ? 'is-active' : ''}`}
       onMouseDown={startPress}
       onMouseUp={endPress}
       onMouseLeave={endPress}
@@ -237,6 +238,7 @@ const ConvCard = ({ conv, projects, tags, selected, bulkMode, onToggleSelect, on
         </span>
         <span className="dot-sep">·</span>
         <span>{conv.updated}</span>
+        {conv.active && <span className="active-dot" title="正在活动 (最近 3 分钟内有写入)"/>}
         {conv.pinned && <span className="pinned"><Icon name="pin" size={10}/></span>}
       </div>
 
