@@ -43,54 +43,17 @@ const App = () => {
   const [searchQuery, setSearchQuery] = useState('');
   const [searchOpen, setSearchOpen] = useState(false);
   const [preview, setPreview] = useState(null); // { conv, x, y, msgs, loading }
-  const [assistant, setAssistant] = useState({ open: false, busy: false, query: '', reply: '', targets: [], action: '' });
-  const [assistantExpanded, setAssistantExpanded] = useState(false);
-  const assistantInputRef = React.useRef(null);
-  const [assistantFilter, setAssistantFilter] = useState(null); // set of sid ids limiting the library view
+  const [merging, setMerging] = useState(false);
   const scrollRef = React.useRef(0);
 
-  const runAssistant = async (query) => {
-    if (!query.trim()) return;
-    setAssistant(a => ({ ...a, busy: true, query, reply: '', targets: [], action: '' }));
-    try {
-      const r = await fetch('/api/assistant', {
-        method: 'POST', headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({ query }),
-      });
-      const d = await r.json();
-      if (!d.ok) { setAssistant(a => ({...a, busy: false, reply: '出错: ' + (d.error||'未知')})); return; }
-      const targets = d.targets || [];
-      const ids = new Set(targets.map(t => t.project + '|' + t.sid));
-      setAssistant({ open: true, busy: false, query, reply: d.reply || '', targets, action: d.action });
-      if (d.action === 'filter') {
-        setAssistantFilter(ids); setOpenConvId(null); setSearchOpen(false);
-      } else if (d.action === 'delete') {
-        if (confirm(`${d.reply}\n确认删除这 ${targets.length} 条会话?`)) {
-          for (const t of targets) {
-            await fetch('/api/delete', {method:'POST', headers:{'Content-Type':'application/json'},
-              body: JSON.stringify(t)});
-          }
-          const idArr = [...ids];
-          removeFromUi(idArr);
-        }
-      } else if (d.action === 'merge') {
-        if (confirm(`${d.reply}\n合并这 ${targets.length} 条为摘要 MD?(可能需要一两分钟)`)) {
-          mergeTargets(targets);
-        }
-      }
-    } catch (e) {
-      setAssistant(a => ({...a, busy: false, reply: '网络错误: ' + e}));
-    }
-  };
-
   const mergeTargets = async (targets) => {
-    setAssistant(a => ({...a, busy: true, reply: '合并中(Claude 正在归纳,请稍候)…'}));
+    setMerging(true);
     try {
       const r = await fetch('/api/merge', {method:'POST', headers:{'Content-Type':'application/json'},
         body: JSON.stringify({ targets })});
       if (!r.ok) {
         const msg = await r.text();
-        setAssistant(a => ({...a, busy: false, reply: '合并失败: ' + msg.slice(0,200)}));
+        alert('合并失败: ' + msg.slice(0, 300));
         return;
       }
       const blob = await r.blob();
@@ -99,9 +62,10 @@ const App = () => {
       a.href = url; a.download = `merged-${Date.now()}.md`;
       document.body.appendChild(a); a.click(); a.remove();
       URL.revokeObjectURL(url);
-      setAssistant(x => ({...x, busy: false, reply: '已合并并开始下载。'}));
     } catch (e) {
-      setAssistant(x => ({...x, busy: false, reply: '合并异常: ' + e}));
+      alert('合并异常: ' + e);
+    } finally {
+      setMerging(false);
     }
   };
 
@@ -297,40 +261,6 @@ const App = () => {
             <span className="search-kbd">⌘K</span>
           </div>
 
-          <div className={`assistant-wrap ${assistantExpanded || assistant.query || assistant.busy ? 'expanded' : ''}`}>
-            {(!assistantExpanded && !assistant.query && !assistant.busy) ? (
-              <button className="assistant-toggle" title="问 Claude (自然语言)"
-                onClick={() => {
-                  setAssistantExpanded(true);
-                  requestAnimationFrame(() => assistantInputRef.current?.focus());
-                }}>
-                <Icon name="sparkles" size={14}/>
-              </button>
-            ) : (
-              <>
-                <Icon name="sparkles" size={14} style={{position:'absolute',left:10,top:'50%',transform:'translateY(-50%)',color:'var(--accent)',pointerEvents:'none'}}/>
-                <input
-                  ref={assistantInputRef}
-                  className="assistant-input"
-                  placeholder="问 Claude:如 把所有 blender 的会话合并"
-                  value={assistant.query}
-                  disabled={assistant.busy}
-                  onChange={(e) => setAssistant(a => ({...a, query: e.target.value}))}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter') runAssistant(assistant.query);
-                    if (e.key === 'Escape') { setAssistantExpanded(false); setAssistant(a => ({...a, query: ''})); }
-                  }}
-                  onBlur={() => { if (!assistant.query && !assistant.busy) setAssistantExpanded(false); }}
-                />
-                {assistantFilter && (
-                  <button className="assistant-clear" title="清除 AI 过滤" onClick={() => setAssistantFilter(null)}>
-                    <Icon name="x" size={12}/>
-                  </button>
-                )}
-              </>
-            )}
-          </div>
-
           <div className="topbar-actions">
             <button className="icon-btn" title="刷新" onClick={() => window.location.reload()}>
               <Icon name="download" size={15} style={{transform:'rotate(180deg)'}}/>
@@ -338,11 +268,10 @@ const App = () => {
           </div>
         </div>
 
-        {(assistant.busy || assistant.reply) && (
+        {merging && (
           <div className="assistant-status">
-            {assistant.busy && <span className="spinner"/>}
-            <span>{assistant.busy ? '正在思考…' : assistant.reply}</span>
-            {!assistant.busy && <button onClick={() => setAssistant(a => ({...a, reply: ''}))}>×</button>}
+            <span className="spinner"/>
+            <span>Claude 正在归纳合并,请稍候…</span>
           </div>
         )}
 
@@ -386,7 +315,6 @@ const App = () => {
               sortBy={sortBy}
               setSortBy={setSortBy}
               scope={{ view, selectedTag }}
-              assistantFilter={assistantFilter}
             />
           )}
         </div>

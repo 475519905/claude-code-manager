@@ -1,10 +1,9 @@
 // Library / List view — main screen
-const LibraryView = ({ data, onOpen, onPreview, selected, setSelected, viewMode, setViewMode, filter, setFilter, sortBy, setSortBy, scope, assistantFilter }) => {
+const LibraryView = ({ data, onOpen, onPreview, selected, setSelected, viewMode, setViewMode, filter, setFilter, sortBy, setSortBy, scope }) => {
   const { conversations, projects, tags } = data;
 
   // Scope filtering
   let filtered = conversations;
-  if (assistantFilter) filtered = filtered.filter(c => assistantFilter.has(c.id));
   if (scope.view === 'pinned') filtered = filtered.filter(c => c.pinned);
   else if (scope.view === 'archive') filtered = filtered.filter(c => c.tags.includes('archive'));
   else if (scope.view === 'recent') filtered = filtered.slice().sort((a,b) => b.updatedSort - a.updatedSort).slice(0, 8);
