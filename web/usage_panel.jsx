@@ -37,7 +37,12 @@ const UsagePanel = () => {
     {label:'本周会话',count:0,cap:80,reset:'—',sub:'每周'},
     {label:'本月会话',count:0,cap:300,reset:'—',sub:'每月'},
     {label:'累计会话',count:0,cap:500,reset:'—',sub:'全部历史'},
-  ]).map(p => ({...p, pct: Math.round(Math.min(100, (p.count / Math.max(p.cap, 1)) * 100))}));
+    {label:'消耗金额估算',displayValue:'$—',reset:'—',sub:'按 token × 模型费率'},
+  ]).map(p => ({
+    ...p,
+    pct: p.displayValue ? 0
+      : Math.round(Math.min(100, (p.count / Math.max(p.cap, 1)) * 100)),
+  }));
 
   const colorFor = (v) => {
     if (v === 0) return 'var(--hm-0)';
@@ -93,11 +98,13 @@ const UsagePanel = () => {
             <div key={i} className="plan-row">
               <div className="plan-row-head">
                 <span className="plan-label">{p.label}</span>
-                <span className="plan-pct mono">{p.count}/{p.cap}</span>
+                <span className="plan-pct mono">{p.displayValue ?? `${p.count}/${p.cap}`}</span>
               </div>
-              <div className="plan-bar">
-                <div className="plan-bar-fill" style={{width: `${Math.max(p.pct, 1)}%`, opacity: p.pct === 0 ? 0.2 : 1}}/>
-              </div>
+              {!p.displayValue && (
+                <div className="plan-bar">
+                  <div className="plan-bar-fill" style={{width: `${Math.max(p.pct, 1)}%`, opacity: p.pct === 0 ? 0.2 : 1}}/>
+                </div>
+              )}
               <div className="plan-row-foot">
                 <span className="plan-sub">{p.sub}</span>
                 <span className="plan-reset mono">{p.reset}</span>
@@ -111,7 +118,7 @@ const UsagePanel = () => {
         <div className="heatmap-col">
           <div className="heatmap-toolbar">
             <div className="seg heatmap-seg">
-              {[{id:'all',l:'全部时间'},{id:'30d',l:'最近 30 天'},{id:'7d',l:'最近 7 天'}].map(r => (
+              {[{id:'all',l:'全部时间'},{id:'30d',l:'30 天'},{id:'7d',l:'7 天'}].map(r => (
                 <button key={r.id} className={range === r.id ? 'active' : ''} onClick={() => setRange(r.id)}>{r.l}</button>
               ))}
             </div>
