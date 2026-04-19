@@ -1,10 +1,13 @@
 // Project detail, search, and settings views
 
-const ProjectView = ({ project, data, onOpen }) => {
+const ProjectView = ({ project, data, onOpen, selected = [], setSelected = () => {}, onPreview }) => {
   const { conversations, projects, tags } = data;
   const convs = conversations.filter(c => c.project === project.id);
   const totalTokens = convs.reduce((s, c) => s + c.tokens, 0);
   const [tab, setTab] = React.useState('conversations');
+  const toggleSelect = (id) => {
+    setSelected(prev => prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]);
+  };
 
   const files = [
     { name: '产品研究访谈_2026Q1.pdf', meta: 'PDF · 2.4 MB · 上传于 4 月 12 日', ext: 'PDF' },
@@ -51,7 +54,12 @@ const ProjectView = ({ project, data, onOpen }) => {
           <div>
             <div className="card-grid" style={{gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))'}}>
               {convs.map(c => (
-                <ConvCard key={c.id} conv={c} projects={projects} tags={tags} selected={false} onToggleSelect={() => {}} onOpen={() => onOpen(c.id)}/>
+                <ConvCard key={c.id} conv={c} projects={projects} tags={tags}
+                  selected={selected.includes(c.id)}
+                  bulkMode={selected.length > 0}
+                  onToggleSelect={() => toggleSelect(c.id)}
+                  onOpen={() => onOpen(c.id)}
+                  onPreview={onPreview}/>
               ))}
             </div>
           </div>

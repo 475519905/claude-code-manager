@@ -300,7 +300,8 @@ const App = () => {
               setDensity={setDensity}
             />
           ) : project ? (
-            <ProjectView project={project} data={data} onOpen={handleOpenConv}/>
+            <ProjectView project={project} data={data} onOpen={handleOpenConv}
+              selected={selected} setSelected={setSelected} onPreview={handlePreview}/>
           ) : (
             <LibraryView
               data={data}
