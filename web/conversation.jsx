@@ -34,6 +34,15 @@ const ConversationView = ({ conv, data, onBack, onDeleted }) => {
       else alert('启动失败: ' + (d.error || '未知'));
     } catch (e) { alert('启动失败: ' + e); }
   };
+  const doCodex = async () => {
+    try {
+      const r = await fetch('/api/codex', {method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({project: conv.project, sid: conv.sid})});
+      const d = await r.json();
+      if (d.ok) alert(`已在新终端启动 Codex\ncd ${d.cwd}\n上下文: ${d.mdPath}`);
+      else alert('启动失败: ' + (d.error || '未知'));
+    } catch (e) { alert('启动失败: ' + e); }
+  };
   const doDelete = async () => {
     if (!confirm(`确认永久删除此对话?\n${conv.title}`)) return;
     const r = await fetch('/api/delete', {method:'POST', headers:{'Content-Type':'application/json'},
@@ -159,6 +168,9 @@ const ConversationView = ({ conv, data, onBack, onDeleted }) => {
           <div style={{display: 'flex', flexDirection: 'column', gap: 2}}>
             <button className="nav-item" style={{padding: '8px 12px'}} onClick={doResume}>
               <Icon name="message" size={14}/> 继续对话
+            </button>
+            <button className="nav-item" style={{padding: '8px 12px'}} onClick={doCodex}>
+              <Icon name="export" size={14}/> 转移到 Codex
             </button>
             <button className="nav-item" style={{padding: '8px 12px'}} onClick={doPin}>
               <Icon name="pin" size={14}/> {conv.pinned ? '取消置顶' : '置顶'}

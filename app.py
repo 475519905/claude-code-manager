@@ -326,6 +326,253 @@ def api_delete():
     return jsonify({"ok": True})
 
 
+def _find_cli(name: str) -> str | None:
+    """Locate a CLI binary without requiring shell resolution."""
+    import shutil as _sh
+    # common Windows / PATH locations
+    for candidate in (name, f"{name}.cmd", f"{name}.exe"):
+        p = _sh.which(candidate)
+        if p:
+            return p
+    return None
+
+
+def _run_cli(args: list[str], stdin_text: str = "", timeout: int = 90) -> tuple[int, str, str]:
+    """Spawn a CLI hidden (no console window) and collect output."""
+    startup = None
+    if sys.platform.startswith("win"):
+        startup = subprocess.STARTUPINFO()
+        startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    try:
+        proc = subprocess.run(
+            args, input=stdin_text, text=True, capture_output=True,
+            encoding="utf-8", errors="replace",
+            timeout=timeout, startupinfo=startup,
+        )
+        return proc.returncode, proc.stdout or "", proc.stderr or ""
+    except subprocess.TimeoutExpired:
+        return -1, "", f"timed out after {timeout}s"
+    except FileNotFoundError as e:
+        return -1, "", str(e)
+
+
+def _session_as_markdown(project: str, sid: str) -> tuple[str, str]:
+    """Return (cwd, markdown) for a given session."""
+    f = _safe_session(project, sid)
+    lines = [f"# Session {sid}", ""]
+    cwd = ""
+    for obj in _iter_jsonl(f):
+        t = obj.get("type")
+        if t == "summary":
+            lines.append(f"> **Summary:** {obj.get('summary','')}")
+            lines.append("")
+            continue
+        if t not in ("user", "assistant"):
+            continue
+        if not cwd and obj.get("cwd"):
+            cwd = obj["cwd"]
+        msg = obj.get("message") or {}
+        text = _extract_text(msg.get("content"))
+        if not text:
+            continue
+        is_tool_result = bool(msg.get("content") and isinstance(msg["content"], list) and
+                              any(isinstance(c, dict) and c.get("type") == "tool_result" for c in msg["content"]))
+        role = "User" if t == "user" and not is_tool_result else ("Tool" if is_tool_result else "Assistant")
+        lines.append(f"## {role}")
+        lines.append(text[:4000])
+        lines.append("")
+    return cwd, "\n".join(lines)
+
+
+@app.route("/api/assistant", methods=["POST"])
+def api_assistant():
+    """Natural-language command → JSON intent via `claude -p`.
+
+    Returns {ok, action, sessionIds, reply} where action ∈ {filter, delete, merge, info, unknown}.
+    """
+    data = request.get_json(silent=True) or {}
+    query = (data.get("query") or "").strip()
+    if not query:
+        return jsonify({"ok": False, "error": "empty query"}), 400
+
+    claude = _find_cli("claude")
+    if not claude:
+        return jsonify({"ok": False, "error": "claude CLI not found on PATH"}), 500
+
+    # Build a compact catalog: up to 400 most-recent sessions, each one line
+    catalog_rows = []
+    if PROJECTS_DIR.exists():
+        entries = []
+        for proj_dir in PROJECTS_DIR.iterdir():
+            if not proj_dir.is_dir():
+                continue
+            for f in proj_dir.glob("*.jsonl"):
+                try:
+                    m = f.stat().st_mtime
+                except OSError:
+                    continue
+                entries.append((m, proj_dir.name, f))
+        entries.sort(key=lambda x: x[0], reverse=True)
+        for m, proj_name, f in entries[:400]:
+            summary = ""
+            first_user = ""
+            try:
+                with open(f, "r", encoding="utf-8", errors="replace") as fh:
+                    for i, line in enumerate(fh):
+                        if i > 40:
+                            break
+                        try:
+                            obj = json.loads(line)
+                        except Exception:
+                            continue
+                        if obj.get("type") == "summary" and not summary:
+                            summary = obj.get("summary", "") or ""
+                        if obj.get("type") == "user" and not first_user:
+                            msg = obj.get("message") or {}
+                            first_user = _extract_text(msg.get("content"))[:120]
+                        if summary and first_user:
+                            break
+            except OSError:
+                continue
+            title = (summary or first_user).replace("\n", " ")[:100]
+            date = datetime.fromtimestamp(m).strftime("%Y-%m-%d")
+            catalog_rows.append(f"{date} | {proj_name} | {f.stem} | {title}")
+    catalog = "\n".join(catalog_rows)
+
+    prompt = (
+        "You are a session management assistant for a local Claude Code session browser.\n"
+        "Below is the catalog of sessions (date | project | sid | title):\n"
+        "===CATALOG START===\n"
+        + catalog + "\n"
+        "===CATALOG END===\n\n"
+        f"User's request (Chinese or English):\n{query}\n\n"
+        "Respond with a single JSON object, no prose, no markdown fences, with keys:\n"
+        '  "action": one of "filter", "delete", "merge", "info"\n'
+        '  "sessionIds": array of sid strings from the catalog (empty if not applicable)\n'
+        '  "reply": short Chinese sentence summarising what you are doing\n'
+        "Rules:\n"
+        "- action='filter' → only return sids that match the user's criteria; do NOT delete.\n"
+        "- action='delete' → only if user explicitly asks to delete; list every sid to remove.\n"
+        "- action='merge'  → user wants multiple sessions merged; list all sids to merge.\n"
+        "- action='info'   → user asks a question that needs no mutation.\n"
+        "- Never invent sids that aren't in the catalog.\n"
+    )
+
+    code, out, err = _run_cli([claude, "-p"], stdin_text=prompt, timeout=180)
+    if code != 0:
+        return jsonify({"ok": False, "error": err or f"claude exit {code}"}), 500
+
+    # Try to locate the JSON object in the output
+    raw = out.strip()
+    try:
+        # trim any stray prose before the first {
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start < 0 or end <= start:
+            raise ValueError("no JSON in response")
+        parsed = json.loads(raw[start:end + 1])
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"bad JSON from claude: {e}", "raw": raw[:800]}), 500
+
+    action = parsed.get("action", "unknown")
+    sids = parsed.get("sessionIds") or []
+    reply = parsed.get("reply", "")
+    # Attach project info so frontend can execute mutations
+    resolved = []
+    if PROJECTS_DIR.exists():
+        for proj_dir in PROJECTS_DIR.iterdir():
+            if not proj_dir.is_dir():
+                continue
+            for f in proj_dir.glob("*.jsonl"):
+                if f.stem in sids:
+                    resolved.append({"project": proj_dir.name, "sid": f.stem})
+    return jsonify({"ok": True, "action": action, "targets": resolved, "reply": reply})
+
+
+@app.route("/api/merge", methods=["POST"])
+def api_merge():
+    """Summarise N sessions into a single meeting-minutes markdown via claude."""
+    data = request.get_json(silent=True) or {}
+    targets = data.get("targets") or []
+    if not targets:
+        return jsonify({"ok": False, "error": "no targets"}), 400
+
+    claude = _find_cli("claude")
+    if not claude:
+        return jsonify({"ok": False, "error": "claude CLI not found"}), 500
+
+    sections = []
+    for t in targets[:20]:  # safety cap
+        proj, sid = t.get("project", ""), t.get("sid", "")
+        try:
+            _, md = _session_as_markdown(proj, sid)
+            sections.append(f"\n\n===== SESSION {sid} =====\n\n{md[:18000]}")
+        except Exception as e:
+            sections.append(f"\n\n===== SESSION {sid} (read failed: {e}) =====\n")
+
+    combined = "".join(sections)
+    prompt = (
+        "你是一个会话归纳助手。下面是若干条 Claude Code 会话原文(按顺序)。\n"
+        "请生成一份会议纪要风格的合并 Markdown,包含:\n"
+        "1. 总览(一段,说明共 N 次对话、主题范围)\n"
+        "2. 按主题分组的要点(每组 3-8 条子项)\n"
+        "3. 待办/未决事项(如有)\n"
+        "4. 涉及的代码/文件清单\n"
+        "不要原样复述对话,提炼为简洁条目。使用中文,合理使用 ## / - / ` 代码风格。\n\n"
+        "===== 原始对话 =====\n"
+        + combined
+    )
+
+    code, out, err = _run_cli([claude, "-p"], stdin_text=prompt, timeout=420)
+    if code != 0:
+        return jsonify({"ok": False, "error": err or f"claude exit {code}"}), 500
+
+    from datetime import datetime as _dt
+    fname = f"merged-{_dt.now().strftime('%Y%m%d-%H%M%S')}.md"
+    payload = io.BytesIO(out.encode("utf-8"))
+    return send_file(payload, as_attachment=True, download_name=fname,
+                     mimetype="text/markdown")
+
+
+@app.route("/api/codex", methods=["POST"])
+def api_codex():
+    """Export session as MD into its cwd and launch codex in that cwd."""
+    data = request.get_json(silent=True) or {}
+    project = data.get("project", "")
+    sid = data.get("sid", "")
+    cwd, md = _session_as_markdown(project, sid)
+    if not cwd or not Path(cwd).exists():
+        return jsonify({"ok": False, "error": f"cwd not found: {cwd}"}), 400
+    md_path = Path(cwd) / f"_claude_manager_{sid}.md"
+    try:
+        md_path.write_text(md, encoding="utf-8")
+    except OSError as e:
+        return jsonify({"ok": False, "error": f"write failed: {e}"}), 500
+
+    codex_path = _find_cli("codex")
+    if not codex_path:
+        return jsonify({"ok": False, "error": "codex CLI not found"}), 500
+
+    prompt = (
+        f"参考同目录下 {md_path.name} 中的先前对话,继续帮我推进这个任务。"
+    )
+    try:
+        if sys.platform.startswith("win"):
+            # Escape the cwd path + embed a short initial prompt referencing the md file.
+            safe_prompt = prompt.replace('"', '\\"')
+            cmd = f'start "" cmd /k "cd /d \"{cwd}\" && codex \"{safe_prompt}\""'
+            subprocess.Popen(cmd, shell=True)
+        elif sys.platform == "darwin":
+            script = f'tell app "Terminal" to do script "cd {json.dumps(cwd)} && codex {json.dumps(prompt)}"'
+            subprocess.Popen(["osascript", "-e", script])
+        else:
+            subprocess.Popen(["x-terminal-emulator", "-e",
+                              f"bash -c 'cd {cwd!r} && codex {json.dumps(prompt)}; exec bash'"])
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+    return jsonify({"ok": True, "cwd": cwd, "mdPath": str(md_path)})
+
+
 @app.route("/api/resume", methods=["POST"])
 def api_resume():
     data = request.get_json(silent=True) or {}
