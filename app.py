@@ -460,7 +460,12 @@ def api_assistant():
 
     code, out, err = _run_cli([claude, "-p"], stdin_text=prompt, timeout=180)
     if code != 0:
-        return jsonify({"ok": False, "error": err or f"claude exit {code}"}), 500
+        msg = (err.strip() or out.strip() or "")[:2000]
+        return jsonify({
+            "ok": False,
+            "error": f"claude exit {code}" + (f": {msg}" if msg else " (no output)"),
+            "stderr": err[:2000], "stdout": out[:2000], "code": code,
+        }), 500
 
     # Try to locate the JSON object in the output
     raw = out.strip()

@@ -5,9 +5,22 @@
 /* Assistant input in topbar */
 .assistant-wrap {
   position: relative;
+  flex: 0 0 auto;
+  transition: flex-basis 0.18s ease-out;
+}
+.assistant-wrap.expanded {
   flex: 0 0 360px;
   max-width: 360px;
 }
+.assistant-toggle {
+  width: 34px; height: 34px;
+  border-radius: var(--radius-sm);
+  display: grid; place-items: center;
+  color: var(--accent);
+  background: var(--accent-soft);
+  transition: background 0.15s, transform 0.15s;
+}
+.assistant-toggle:hover { background: var(--bg-hover); transform: scale(1.05); }
 .assistant-input {
   width: 100%;
   padding: 8px 30px 8px 32px;

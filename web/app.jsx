@@ -44,6 +44,8 @@ const App = () => {
   const [searchOpen, setSearchOpen] = useState(false);
   const [preview, setPreview] = useState(null); // { conv, x, y, msgs, loading }
   const [assistant, setAssistant] = useState({ open: false, busy: false, query: '', reply: '', targets: [], action: '' });
+  const [assistantExpanded, setAssistantExpanded] = useState(false);
+  const assistantInputRef = React.useRef(null);
   const [assistantFilter, setAssistantFilter] = useState(null); // set of sid ids limiting the library view
   const scrollRef = React.useRef(0);
 
@@ -295,20 +297,37 @@ const App = () => {
             <span className="search-kbd">⌘K</span>
           </div>
 
-          <div className="assistant-wrap">
-            <Icon name="sparkles" size={14} style={{position:'absolute',left:10,top:'50%',transform:'translateY(-50%)',color:'var(--accent)',pointerEvents:'none'}}/>
-            <input
-              className="assistant-input"
-              placeholder="问 Claude:如 把所有 blender 的会话合并"
-              value={assistant.query}
-              disabled={assistant.busy}
-              onChange={(e) => setAssistant(a => ({...a, query: e.target.value}))}
-              onKeyDown={(e) => { if (e.key === 'Enter') runAssistant(assistant.query); }}
-            />
-            {assistantFilter && (
-              <button className="assistant-clear" title="清除 AI 过滤" onClick={() => setAssistantFilter(null)}>
-                <Icon name="x" size={12}/>
+          <div className={`assistant-wrap ${assistantExpanded || assistant.query || assistant.busy ? 'expanded' : ''}`}>
+            {(!assistantExpanded && !assistant.query && !assistant.busy) ? (
+              <button className="assistant-toggle" title="问 Claude (自然语言)"
+                onClick={() => {
+                  setAssistantExpanded(true);
+                  requestAnimationFrame(() => assistantInputRef.current?.focus());
+                }}>
+                <Icon name="sparkles" size={14}/>
               </button>
+            ) : (
+              <>
+                <Icon name="sparkles" size={14} style={{position:'absolute',left:10,top:'50%',transform:'translateY(-50%)',color:'var(--accent)',pointerEvents:'none'}}/>
+                <input
+                  ref={assistantInputRef}
+                  className="assistant-input"
+                  placeholder="问 Claude:如 把所有 blender 的会话合并"
+                  value={assistant.query}
+                  disabled={assistant.busy}
+                  onChange={(e) => setAssistant(a => ({...a, query: e.target.value}))}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') runAssistant(assistant.query);
+                    if (e.key === 'Escape') { setAssistantExpanded(false); setAssistant(a => ({...a, query: ''})); }
+                  }}
+                  onBlur={() => { if (!assistant.query && !assistant.busy) setAssistantExpanded(false); }}
+                />
+                {assistantFilter && (
+                  <button className="assistant-clear" title="清除 AI 过滤" onClick={() => setAssistantFilter(null)}>
+                    <Icon name="x" size={12}/>
+                  </button>
+                )}
+              </>
             )}
           </div>
 
