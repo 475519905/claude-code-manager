@@ -718,6 +718,43 @@ def api_active():
     return jsonify({"active": active, "windowSecs": ACTIVE_WINDOW_SECS})
 
 
+@app.route("/api/account")
+def api_account():
+    """Return whatever Claude plan info we can glean from ~/.claude/.credentials.json."""
+    cred_path = Path.home() / ".claude" / ".credentials.json"
+    if not cred_path.exists():
+        return jsonify({"ok": False, "error": "credentials file not found"})
+    try:
+        with open(cred_path, "r", encoding="utf-8") as f:
+            cred = json.load(f)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
+    oauth = cred.get("claudeAiOauth") or {}
+    sub_type = (oauth.get("subscriptionType") or "").lower()
+    tier = oauth.get("rateLimitTier") or ""
+    plan_map = {"max": "Max", "pro": "Pro", "free": "Free", "team": "Team"}
+    tier_pretty = ""
+    if "20x" in tier:
+        tier_pretty = "Max · 20×"
+    elif "5x" in tier:
+        tier_pretty = "Max · 5×"
+    elif tier:
+        tier_pretty = tier.replace("default_", "").replace("_", " ").title()
+    expires_at = oauth.get("expiresAt")
+    expires_iso = ""
+    if isinstance(expires_at, (int, float)):
+        try:
+            expires_iso = datetime.fromtimestamp(expires_at / 1000).strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            pass
+    return jsonify({
+        "ok": True,
+        "plan": plan_map.get(sub_type, sub_type.title() or "—"),
+        "tier": tier_pretty,
+        "tokenExpiresAt": expires_iso,
+    })
+
+
 @app.route("/api/stats")
 def api_stats():
     """Aggregate session activity for the usage panel (heatmap + stats)."""

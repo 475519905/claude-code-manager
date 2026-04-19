@@ -382,6 +382,14 @@ input, textarea {
   color: var(--ink-3);
   font-family: var(--font-mono);
 }
+.user-email {
+  font-size: 10.5px;
+  color: var(--ink-4);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  margin-top: 1px;
+}
 
 /* ===================================================================
    Main content
