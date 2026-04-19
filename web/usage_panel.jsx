@@ -113,42 +113,77 @@ const UsagePanel = () => {
           </div>
 
           <div className="heatmap-wrap">
-            <div className="heatmap-months">
-              {months.map((m, i) => (
-                <span key={i} style={{left: `${(i / (months.length - 1)) * 100}%`}}>{m}</span>
-              ))}
-            </div>
-
-            <div className="heatmap-body">
-              <div className="heatmap-days">
-                {dayLabels.map((d, i) => <span key={i}>{d}</span>)}
+            {range === 'all' && (
+              <div className="heatmap-months">
+                {months.map((m, i) => (
+                  <span key={i} style={{left: `${(i / (months.length - 1)) * 100}%`}}>{m}</span>
+                ))}
               </div>
-              {(() => {
-                const visibleWeeks = range === '7d' ? 1 : range === '30d' ? 5 : weeks;
-                const firstCol = weeks - visibleWeeks;
-                const svgW = visibleWeeks * (cellSize + cellGap) - cellGap;
-                const svgH = 7 * (cellSize + cellGap) - cellGap;
-                return (
-                  <svg className="heatmap-svg" key={range}
-                    width={svgW} height={svgH}
-                    viewBox={`0 0 ${svgW} ${svgH}`}>
-                    {heatmapData.map((row, d) =>
-                      row.slice(firstCol).map((v, w) => (
-                        <rect
-                          key={`${d}-${w}`}
-                          x={w * (cellSize + cellGap)}
-                          y={d * (cellSize + cellGap)}
-                          width={cellSize}
-                          height={cellSize}
-                          rx="2"
-                          fill={colorFor(v)}
-                        />
-                      ))
-                    )}
-                  </svg>
-                );
-              })()}
-            </div>
+            )}
+
+            {range === 'all' ? (
+              <div className="heatmap-body">
+                <div className="heatmap-days">
+                  {dayLabels.map((d, i) => <span key={i}>{d}</span>)}
+                </div>
+                <svg className="heatmap-svg" key="all"
+                  width={weeks * (cellSize + cellGap) - cellGap}
+                  height={7 * (cellSize + cellGap) - cellGap}
+                  viewBox={`0 0 ${weeks * (cellSize + cellGap) - cellGap} ${7 * (cellSize + cellGap) - cellGap}`}>
+                  {heatmapData.map((row, d) =>
+                    row.map((v, w) => (
+                      <rect
+                        key={`${d}-${w}`}
+                        x={w * (cellSize + cellGap)}
+                        y={d * (cellSize + cellGap)}
+                        width={cellSize}
+                        height={cellSize}
+                        rx="2"
+                        fill={colorFor(v)}
+                      />
+                    ))
+                  )}
+                </svg>
+              </div>
+            ) : (() => {
+              const n = range === '7d' ? 7 : 30;
+              const series = (apiStats && apiStats.recentDays ? apiStats.recentDays : []).slice(-n);
+              const cw = range === '7d' ? 34 : 16;     // cell width per day
+              const ch = range === '7d' ? 44 : 38;     // cell height
+              const gap = range === '7d' ? 6 : 3;
+              return (
+                <div className="heatmap-strip" key={range}>
+                  <div className="strip-row" style={{display:'flex',gap:`${gap}px`}}>
+                    {series.map((d, i) => (
+                      <div key={d.date}
+                        title={`${d.date} · ${d.count} 次会话`}
+                        style={{
+                          width: cw, height: ch, borderRadius: 4,
+                          background: colorFor(d.level),
+                          display: 'flex', alignItems: 'flex-end', justifyContent: 'center',
+                          paddingBottom: 2, fontSize: 9,
+                          color: d.level >= 3 ? 'white' : 'var(--ink-3)',
+                          fontFamily: 'var(--font-mono)',
+                        }}>
+                        {range === '7d' && new Date(d.date).getDate()}
+                      </div>
+                    ))}
+                  </div>
+                  <div style={{display:'flex',gap:`${gap}px`,marginTop:6,fontSize:10,color:'var(--ink-4)',fontFamily:'var(--font-mono)'}}>
+                    {series.map((d, i) => {
+                      const showLabel = range === '7d'
+                        ? true
+                        : (i === 0 || i === series.length - 1 || new Date(d.date).getDate() === 1);
+                      return (
+                        <div key={d.date} style={{width: cw, textAlign:'center'}}>
+                          {showLabel ? (range === '7d' ? ['日','一','二','三','四','五','六'][new Date(d.date).getDay()] : d.date.slice(5)) : ''}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              );
+            })()}
 
             <div className="heatmap-legend">
               <span>少</span>
@@ -170,7 +205,7 @@ const UsagePanel = () => {
 
           <div className="fun-fact">
             <Icon name="sparkles" size={13}/>
-            <span>共扫描 <span className="mono" style={{color: 'var(--ink)'}}>{t.sessions != null ? t.sessions : '…'}</span> 条本地会话 · 连续活跃 <span className="mono" style={{color: 'var(--ink)'}}>{t.streak || '—'}</span></span>
+            <span>共扫描 <span className="mono" style={{color: 'var(--ink)'}}>{t.sessions != null ? t.sessions : '…'}</span> 条本地会话 · 活跃 <span className="mono" style={{color: 'var(--ink)'}}>{t.activeDays != null ? t.activeDays : '…'}</span> 天</span>
           </div>
         </div>
       </div>)}

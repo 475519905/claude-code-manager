@@ -98,11 +98,7 @@ const Sidebar = ({ view, setView, selectedProject, setSelectedProject, selectedT
         <div className="avatar">{profile.name.charAt(0)}</div>
         <div className="user-meta">
           <div className="user-name" title={profile.email}>{profile.name}</div>
-          <div className="user-plan">
-            {account && account.ok
-              ? `${account.plan}${account.tier ? ' · ' + account.tier : ''}`
-              : `${data.conversations.length} 会话`}
-          </div>
+          <div className="user-plan">Claude Max Plan 20×</div>
           <div className="user-email" title={profile.email}>{profile.email}</div>
         </div>
       </div>

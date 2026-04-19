@@ -886,6 +886,16 @@ def api_stats():
         longest_txt = " ".join(parts)
 
     fav_model = model_count.most_common(1)
+    active_days_total = len([d for d, c in day_count.items() if c > 0])
+    # Flat per-day timeline for the last 90 days (so the 7d/30d chips can render
+    # a clean horizontal strip instead of being a sliver of the 7×53 column grid).
+    recent_days = []
+    for offset in range(89, -1, -1):
+        d = today.fromordinal(today.toordinal() - offset)
+        iso = d.isoformat()
+        cnt = day_count.get(iso, 0)
+        level = 0 if not cnt else min(4, 1 + math.floor(cnt / max(1, maxv) * 3.999))
+        recent_days.append({"date": iso, "count": cnt, "level": level})
     totals = {
         "favoriteModel": fav_model[0][0].replace("claude-", "").replace("-", " ") if fav_model else "",
         "totalTokens": f"{(total_bytes / 4 / 1_000_000):.1f}m" if total_bytes else "0",
@@ -893,6 +903,7 @@ def api_stats():
         "longest": longest_txt or "—",
         "mostActiveDay": most_msgs_day[0] or "—",
         "streak": f"{streak} day{'s' if streak != 1 else ''}",
+        "activeDays": active_days_total,
     }
     plans = [
         {"label": "今日会话", "count": day_sessions, "cap": 20, "reset": _fmt_delta(int((next_midnight - now).total_seconds())), "sub": "每日"},
@@ -900,7 +911,7 @@ def api_stats():
         {"label": "本月会话", "count": month_sessions, "cap": 300, "reset": _fmt_delta(int((next_month - now).total_seconds())), "sub": "每月"},
         {"label": "累计会话", "count": total_sessions, "cap": max(total_sessions, 500), "reset": "不重置", "sub": "全部历史"},
     ]
-    return jsonify({"heatmap": grid, "totals": totals, "plans": plans})
+    return jsonify({"heatmap": grid, "totals": totals, "plans": plans, "recentDays": recent_days})
 
 
 def _no_cache(resp):
