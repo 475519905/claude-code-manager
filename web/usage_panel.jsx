@@ -8,13 +8,6 @@ const UsagePanel = () => {
     fetch('/api/stats').then(r => r.json()).then(setApiStats).catch(() => {});
   }, []);
 
-  // trim heatmap by range
-  const trimHeatmap = (grid) => {
-    if (!grid || grid.length !== 7) return grid;
-    if (range === '7d')  return grid.map(row => row.slice(-1));
-    if (range === '30d') return grid.map(row => row.slice(-5));
-    return grid;
-  };
 
   // Month labels relative to today going back 13 months
   const monthNames = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
@@ -37,12 +30,7 @@ const UsagePanel = () => {
     {label:'本周会话',count:0,cap:80,reset:'—',sub:'每周'},
     {label:'本月会话',count:0,cap:300,reset:'—',sub:'每月'},
     {label:'累计会话',count:0,cap:500,reset:'—',sub:'全部历史'},
-    {label:'消耗金额估算',displayValue:'$—',reset:'—',sub:'按 token × 模型费率'},
-  ]).map(p => ({
-    ...p,
-    pct: p.displayValue ? 0
-      : Math.round(Math.min(100, (p.count / Math.max(p.cap, 1)) * 100)),
-  }));
+  ]).map(p => ({...p, pct: Math.round(Math.min(100, (p.count / Math.max(p.cap, 1)) * 100))}));
 
   const colorFor = (v) => {
     if (v === 0) return 'var(--hm-0)';
@@ -118,7 +106,7 @@ const UsagePanel = () => {
         <div className="heatmap-col">
           <div className="heatmap-toolbar">
             <div className="seg heatmap-seg">
-              {[{id:'all',l:'全部时间'},{id:'30d',l:'30 天'},{id:'7d',l:'7 天'}].map(r => (
+              {[{id:'all',l:'全部'},{id:'30d',l:'30 天'},{id:'7d',l:'7 天'}].map(r => (
                 <button key={r.id} className={range === r.id ? 'active' : ''} onClick={() => setRange(r.id)}>{r.l}</button>
               ))}
             </div>
@@ -135,25 +123,31 @@ const UsagePanel = () => {
               <div className="heatmap-days">
                 {dayLabels.map((d, i) => <span key={i}>{d}</span>)}
               </div>
-              <svg className="heatmap-svg"
-                width={(range === '7d' ? 1 : range === '30d' ? 5 : weeks) * (cellSize + cellGap) - cellGap}
-                height={7 * (cellSize + cellGap) - cellGap}
-                viewBox={`0 0 ${(range === '7d' ? 1 : range === '30d' ? 5 : weeks) * (cellSize + cellGap) - cellGap} ${7 * (cellSize + cellGap) - cellGap}`}
-              >
-                {trimHeatmap(heatmapData).map((row, d) =>
-                  row.map((v, w) => (
-                    <rect
-                      key={`${d}-${w}`}
-                      x={w * (cellSize + cellGap)}
-                      y={d * (cellSize + cellGap)}
-                      width={cellSize}
-                      height={cellSize}
-                      rx="2"
-                      fill={colorFor(v)}
-                    />
-                  ))
-                )}
-              </svg>
+              {(() => {
+                const visibleWeeks = range === '7d' ? 1 : range === '30d' ? 5 : weeks;
+                const firstCol = weeks - visibleWeeks;
+                const svgW = visibleWeeks * (cellSize + cellGap) - cellGap;
+                const svgH = 7 * (cellSize + cellGap) - cellGap;
+                return (
+                  <svg className="heatmap-svg" key={range}
+                    width={svgW} height={svgH}
+                    viewBox={`0 0 ${svgW} ${svgH}`}>
+                    {heatmapData.map((row, d) =>
+                      row.slice(firstCol).map((v, w) => (
+                        <rect
+                          key={`${d}-${w}`}
+                          x={w * (cellSize + cellGap)}
+                          y={d * (cellSize + cellGap)}
+                          width={cellSize}
+                          height={cellSize}
+                          rx="2"
+                          fill={colorFor(v)}
+                        />
+                      ))
+                    )}
+                  </svg>
+                );
+              })()}
             </div>
 
             <div className="heatmap-legend">

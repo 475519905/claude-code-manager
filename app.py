@@ -386,7 +386,6 @@ def api_stats():
     longest = 0
     most_msgs_day = ("", 0)
     streak_set = set()
-    cost_usd = [0.0]  # 1-element list so the inner loop can mutate it
 
     for proj_dir in PROJECTS_DIR.iterdir():
         if not proj_dir.is_dir():
@@ -415,19 +414,6 @@ def api_stats():
                     if not first_ts:
                         first_ts = ts
                     last_ts = ts
-            # rough per-session cost estimate (USD) — see `cost_usd` accumulator below
-            tokens = f_bytes / 4
-            dominant = session_models.most_common(1)[0][0] if session_models else ""
-            d_lower = dominant.lower()
-            if "opus" in d_lower:
-                rate = 20.0       # USD per 1M tokens, blended w/ prompt caching
-            elif "haiku" in d_lower:
-                rate = 1.5
-            elif "sonnet" in d_lower:
-                rate = 5.0
-            else:
-                rate = 5.0
-            cost_usd[0] += tokens * rate / 1_000_000
             if first_ts:
                 day = first_ts[:10]
                 day_count[day] += 1
@@ -531,8 +517,6 @@ def api_stats():
         {"label": "本周会话", "count": week_sessions, "cap": 80, "reset": _fmt_delta(int((next_sunday - now).total_seconds())), "sub": "每周"},
         {"label": "本月会话", "count": month_sessions, "cap": 300, "reset": _fmt_delta(int((next_month - now).total_seconds())), "sub": "每月"},
         {"label": "累计会话", "count": total_sessions, "cap": max(total_sessions, 500), "reset": "不重置", "sub": "全部历史"},
-        {"label": "消耗金额估算", "displayValue": f"${cost_usd[0]:,.2f}", "pct": 0,
-         "reset": "按 token × 模型费率", "sub": "Opus×20 / Sonnet×5 / Haiku×1.5 per M"},
     ]
     return jsonify({"heatmap": grid, "totals": totals, "plans": plans})
 
