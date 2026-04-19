@@ -68,6 +68,30 @@ def _iter_jsonl(path: Path):
         return
 
 
+import re as _re
+_CMD_NAME_RE = _re.compile(r"<command-name>\s*(\S+?)\s*</command-name>", _re.DOTALL)
+_CMD_ARGS_RE = _re.compile(r"<command-args>\s*([\s\S]*?)\s*</command-args>", _re.DOTALL)
+
+
+def _is_command_wrapper(text: str) -> bool:
+    s = text.lstrip()
+    return s.startswith("<command-") or s.startswith("<local-command")
+
+
+def _clean_user_text(text: str) -> str:
+    """If `text` is a slash-command wrapper, return the real user intent; else return text."""
+    if not _is_command_wrapper(text):
+        return text
+    args = _CMD_ARGS_RE.search(text)
+    if args and args.group(1).strip():
+        return args.group(1).strip()
+    name = _CMD_NAME_RE.search(text)
+    if name:
+        return name.group(1).strip()
+    # system caveats / empty wrappers — return empty to skip
+    return ""
+
+
 def _extract_text(content: Any) -> str:
     if isinstance(content, str):
         return content
@@ -120,9 +144,10 @@ def _summarize_session(project: str, path: Path) -> dict:
             is_meta = obj.get("isMeta") or False
             is_tool_result = bool(msg.get("content") and isinstance(msg["content"], list) and
                                   any(isinstance(c, dict) and c.get("type") == "tool_result" for c in msg["content"]))
-            if text and not is_meta and not is_tool_result:
+            cleaned = _clean_user_text(text) if text else ""
+            if cleaned and not is_meta and not is_tool_result:
                 if not first_user_text:
-                    first_user_text = text[:200]
+                    first_user_text = cleaned[:200]
                 user_count += 1
         elif t == "assistant":
             assistant_count += 1
@@ -206,6 +231,12 @@ def api_session_detail(project: str, sid: str):
         is_meta = obj.get("isMeta") or False
         is_tool_result = bool(msg.get("content") and isinstance(msg["content"], list) and
                               any(isinstance(c, dict) and c.get("type") == "tool_result" for c in msg["content"]))
+        # Collapse slash-command wrappers into a friendlier display
+        if t == "user" and _is_command_wrapper(text):
+            cleaned = _clean_user_text(text)
+            if not cleaned:
+                continue
+            text = f"/{cleaned}" if not cleaned.startswith("/") and len(cleaned.split()) == 1 else cleaned
         messages.append({
             "role": t,
             "text": text,
