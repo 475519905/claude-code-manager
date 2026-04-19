@@ -368,7 +368,8 @@ def _find_cli(name: str) -> str | None:
     return None
 
 
-def _run_cli(args: list[str], stdin_text: str = "", timeout: int = 90) -> tuple[int, str, str]:
+def _run_cli(args: list[str], stdin_text: str = "", timeout: int = 90,
+             cwd: str | None = None) -> tuple[int, str, str]:
     """Spawn a CLI hidden (no console window) and collect output."""
     startup = None
     if sys.platform.startswith("win"):
@@ -378,13 +379,74 @@ def _run_cli(args: list[str], stdin_text: str = "", timeout: int = 90) -> tuple[
         proc = subprocess.run(
             args, input=stdin_text, text=True, capture_output=True,
             encoding="utf-8", errors="replace",
-            timeout=timeout, startupinfo=startup,
+            timeout=timeout, startupinfo=startup, cwd=cwd,
         )
         return proc.returncode, proc.stdout or "", proc.stderr or ""
     except subprocess.TimeoutExpired:
         return -1, "", f"timed out after {timeout}s"
     except FileNotFoundError as e:
         return -1, "", str(e)
+
+
+_SCRATCH_CWD = Path.home() / ".claude-manager-scratch"
+
+
+def _encoded_project(path: Path) -> str:
+    """Match Claude Code's `~/.claude/projects/<encoded>` encoding."""
+    return str(path).replace(":", "-").replace("\\", "-").replace("/", "-")
+
+
+def _run_claude_isolated(args: list[str], stdin_text: str = "", timeout: int = 90) -> tuple[int, str, str]:
+    """Run the claude CLI in an isolated scratch cwd, then purge whatever
+    session jsonl it created — Claude Code auto-persists every -p invocation
+    as a session, which would otherwise pollute the session browser."""
+    _SCRATCH_CWD.mkdir(exist_ok=True)
+    code, out, err = _run_cli(args, stdin_text=stdin_text, timeout=timeout, cwd=str(_SCRATCH_CWD))
+    proj = PROJECTS_DIR / _encoded_project(_SCRATCH_CWD)
+    if proj.exists():
+        import shutil as _shutil
+        _shutil.rmtree(proj, ignore_errors=True)
+    return code, out, err
+
+
+def _purge_assistant_leftovers() -> int:
+    """One-shot cleanup at startup: remove session files that are obvious
+    leftovers from the assistant/merge endpoints (they begin with our
+    system prompt). Returns count removed."""
+    if not PROJECTS_DIR.exists():
+        return 0
+    markers = (
+        "You are a session management assistant",
+        "你是一个会话归纳助手",
+    )
+    removed = 0
+    for proj_dir in PROJECTS_DIR.iterdir():
+        if not proj_dir.is_dir():
+            continue
+        for f in list(proj_dir.glob("*.jsonl")):
+            try:
+                with open(f, "r", encoding="utf-8", errors="replace") as fh:
+                    head = fh.read(4000)
+            except OSError:
+                continue
+            if any(m in head for m in markers):
+                try:
+                    f.unlink()
+                    removed += 1
+                    # Also remove the sidecar snapshot dir if present
+                    sidecar = proj_dir / f.stem
+                    if sidecar.exists() and sidecar.is_dir():
+                        import shutil as _shutil
+                        _shutil.rmtree(sidecar, ignore_errors=True)
+                except OSError:
+                    pass
+        # If the project dir ends up empty, drop it too
+        try:
+            if not any(proj_dir.iterdir()):
+                proj_dir.rmdir()
+        except OSError:
+            pass
+    return removed
 
 
 def _session_as_markdown(project: str, sid: str) -> tuple[str, str]:
@@ -489,7 +551,7 @@ def api_assistant():
         "- Never invent sids that aren't in the catalog.\n"
     )
 
-    code, out, err = _run_cli([claude, "-p"], stdin_text=prompt, timeout=180)
+    code, out, err = _run_claude_isolated([claude, "-p"], stdin_text=prompt, timeout=180)
     if code != 0:
         msg = (err.strip() or out.strip() or "")[:2000]
         return jsonify({
@@ -559,7 +621,7 @@ def api_merge():
         + combined
     )
 
-    code, out, err = _run_cli([claude, "-p"], stdin_text=prompt, timeout=420)
+    code, out, err = _run_claude_isolated([claude, "-p"], stdin_text=prompt, timeout=420)
     if code != 0:
         return jsonify({"ok": False, "error": err or f"claude exit {code}"}), 500
 
@@ -848,6 +910,9 @@ def main():
     print("Claude Manager")
     print(f"Projects dir: {PROJECTS_DIR}")
     print(f"Serving on http://{HOST}:{PORT}")
+    purged = _purge_assistant_leftovers()
+    if purged:
+        print(f"Purged {purged} assistant-leftover session file(s)")
 
     threading.Thread(target=_run_flask, daemon=True).start()
     _wait_for_server()
