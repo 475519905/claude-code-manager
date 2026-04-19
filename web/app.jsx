@@ -51,17 +51,13 @@ const App = () => {
     try {
       const r = await fetch('/api/merge', {method:'POST', headers:{'Content-Type':'application/json'},
         body: JSON.stringify({ targets })});
-      if (!r.ok) {
-        const msg = await r.text();
-        alert('合并失败: ' + msg.slice(0, 300));
+      const d = await r.json().catch(() => null);
+      if (!r.ok || !d || !d.ok) {
+        const msg = (d && d.error) || `HTTP ${r.status}`;
+        alert('合并失败: ' + String(msg).slice(0, 400));
         return;
       }
-      const blob = await r.blob();
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url; a.download = `merged-${Date.now()}.md`;
-      document.body.appendChild(a); a.click(); a.remove();
-      URL.revokeObjectURL(url);
+      alert(`已生成合并摘要 (${(d.bytes/1024).toFixed(1)} KB,${d.count} 条)\n保存到:\n${d.path}`);
     } catch (e) {
       alert('合并异常: ' + e);
     } finally {

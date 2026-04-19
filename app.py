@@ -623,13 +623,27 @@ def api_merge():
 
     code, out, err = _run_claude_isolated([claude, "-p"], stdin_text=prompt, timeout=420)
     if code != 0:
-        return jsonify({"ok": False, "error": err or f"claude exit {code}"}), 500
+        msg = (err.strip() or out.strip() or "")[:2000]
+        return jsonify({"ok": False, "error": f"claude exit {code}" + (f": {msg}" if msg else "")}), 500
 
     from datetime import datetime as _dt
     fname = f"merged-{_dt.now().strftime('%Y%m%d-%H%M%S')}.md"
-    payload = io.BytesIO(out.encode("utf-8"))
-    return send_file(payload, as_attachment=True, download_name=fname,
-                     mimetype="text/markdown")
+    # Write directly to the user's Downloads folder — programmatic <a download>
+    # in a pywebview window is unreliable, so we let the backend own the filesystem.
+    downloads = Path.home() / "Downloads"
+    downloads.mkdir(exist_ok=True)
+    out_path = downloads / fname
+    try:
+        out_path.write_text(out, encoding="utf-8")
+    except OSError as e:
+        return jsonify({"ok": False, "error": f"write failed: {e}"}), 500
+    return jsonify({
+        "ok": True,
+        "path": str(out_path),
+        "filename": fname,
+        "bytes": len(out.encode("utf-8")),
+        "count": len(targets),
+    })
 
 
 @app.route("/api/codex", methods=["POST"])
