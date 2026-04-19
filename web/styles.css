@@ -1093,14 +1093,16 @@ input, textarea {
   bottom: 24px;
   left: 50%;
   transform: translateX(-50%) translateY(calc(100% + 40px));
-  background: var(--ink);
-  color: var(--bg);
+  /* Theme-independent dark pill (floating action-bar convention) */
+  background: oklch(22% 0.010 265);
+  color: oklch(96% 0.004 85);
+  border: 1px solid oklch(100% 0 0 / 0.08);
   border-radius: 999px;
   padding: 8px 8px 8px 18px;
   display: flex;
   align-items: center;
   gap: 4px;
-  box-shadow: var(--shadow-lg);
+  box-shadow: 0 10px 30px oklch(0% 0 0 / 0.35);
   z-index: 100;
   transition: transform 0.25s cubic-bezier(0.4, 0, 0.2, 1);
 }
@@ -1114,6 +1116,7 @@ input, textarea {
   padding-right: 8px;
   border-right: 1px solid oklch(100% 0 0 / 0.15);
   margin-right: 4px;
+  color: oklch(96% 0.004 85);
 }
 .bulk-bar button {
   display: inline-flex;
@@ -1121,13 +1124,14 @@ input, textarea {
   gap: 6px;
   padding: 6px 12px;
   border-radius: 999px;
-  color: var(--bg);
+  color: oklch(96% 0.004 85);
   font-size: 12.5px;
   font-weight: 500;
   transition: background 0.1s;
 }
 .bulk-bar button:hover { background: oklch(100% 0 0 / 0.12); }
 .bulk-bar button svg { width: 13px; height: 13px; }
+.bulk-bar .danger { color: oklch(82% 0.15 25); }
 .bulk-bar .danger:hover { background: oklch(60% 0.18 25 / 0.3); color: oklch(92% 0.05 25); }
 
 /* ===================================================================
