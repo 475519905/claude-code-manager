@@ -1,8 +1,9 @@
 @echo off
 cd /d "%~dp0"
 echo Building ClaudeConvManager.exe ...
-pyinstaller --onefile --name ClaudeConvManager ^
+pyinstaller --onefile --windowed --name ClaudeConvManager ^
   --hidden-import werkzeug.serving ^
+  --collect-all webview ^
   --add-data "web;web" ^
   --noconfirm --clean ^
   app.py

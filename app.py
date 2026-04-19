@@ -540,23 +540,57 @@ def static_file(filename: str):
     return _no_cache(send_from_directory(str(WEB_DIR), filename))
 
 
-def _open_browser():
-    time.sleep(1.0)
-    try:
-        webbrowser.open(f"http://{HOST}:{PORT}")
-    except Exception:
-        pass
+def _run_flask():
+    from werkzeug.serving import make_server
+    srv = make_server(HOST, PORT, app, threaded=True)
+    srv.serve_forever()
+
+
+def _wait_for_server(timeout: float = 5.0) -> bool:
+    import socket
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with socket.create_connection((HOST, PORT), timeout=0.3):
+                return True
+        except OSError:
+            time.sleep(0.1)
+    return False
 
 
 def main():
-    print(f"Claude Conversation Manager")
+    print("Claude Conversation Manager")
     print(f"Projects dir: {PROJECTS_DIR}")
     print(f"Serving on http://{HOST}:{PORT}")
-    threading.Thread(target=_open_browser, daemon=True).start()
-    from werkzeug.serving import make_server
-    srv = make_server(HOST, PORT, app, threaded=True)
+
+    threading.Thread(target=_run_flask, daemon=True).start()
+    _wait_for_server()
+
+    # Prefer a native window via pywebview. Fall back to the default browser
+    # if pywebview or its backend (e.g. WebView2 runtime) is unavailable.
+    use_browser = "--browser" in sys.argv
+    if not use_browser:
+        try:
+            import webview  # type: ignore
+            webview.create_window(
+                "Claude 对话管理器",
+                f"http://{HOST}:{PORT}",
+                width=1280, height=840,
+                min_size=(960, 640),
+                text_select=True,
+            )
+            webview.start()
+            return
+        except Exception as e:
+            print(f"pywebview unavailable ({e}); falling back to browser…")
+
+    threading.Thread(
+        target=lambda: (time.sleep(0.3), webbrowser.open(f"http://{HOST}:{PORT}")),
+        daemon=True,
+    ).start()
     try:
-        srv.serve_forever()
+        while True:
+            time.sleep(1)
     except KeyboardInterrupt:
         print("bye")
 
