@@ -575,8 +575,8 @@ def main():
             webview.create_window(
                 "Claude 对话管理器",
                 f"http://{HOST}:{PORT}",
-                width=1920, height=1260,  # 1.5x of 1280x840 to pair with CSS zoom
-                min_size=(1280, 800),
+                width=1280, height=840,
+                min_size=(960, 640),
                 text_select=True,
             )
             webview.start()
