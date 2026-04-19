@@ -17,7 +17,7 @@ const Sidebar = ({ view, setView, selectedProject, setSelectedProject, selectedT
   return (
     <aside className="sidebar">
       <div className="brand">
-        <div className="brand-mark">C</div>
+        <img className="brand-mark" src="/icon.png" alt="" draggable="false"/>
         <div className="brand-name"><span className="zh">对话管理器</span></div>
       </div>
 

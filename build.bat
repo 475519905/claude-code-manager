@@ -2,6 +2,7 @@
 cd /d "%~dp0"
 echo Building ClaudeConvManager.exe ...
 pyinstaller --onefile --windowed --name ClaudeConvManager ^
+  --icon icon.ico ^
   --hidden-import werkzeug.serving ^
   --collect-all webview ^
   --add-data "web;web" ^
