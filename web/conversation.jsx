@@ -30,26 +30,29 @@ const ConversationView = ({ conv, data, onBack, onDeleted }) => {
       const r = await fetch('/api/resume', {method:'POST', headers:{'Content-Type':'application/json'},
         body: JSON.stringify({project: conv.project, sid: conv.sid})});
       const d = await r.json();
-      if (d.ok) alert(`已在新终端启动:\ncd ${d.cwd}\nclaude --resume ${conv.sid}`);
-      else alert('启动失败: ' + (d.error || '未知'));
-    } catch (e) { alert('启动失败: ' + e); }
+      if (d.ok) window.dialog.alert(`已在新终端启动:\ncd ${d.cwd}\nclaude --resume ${conv.sid}`, {title:'继续对话'});
+      else window.dialog.alert('启动失败: ' + (d.error || '未知'), {title:'启动失败', danger:true});
+    } catch (e) { window.dialog.alert('启动失败: ' + e, {title:'启动失败', danger:true}); }
   };
   const doCodex = async () => {
     try {
       const r = await fetch('/api/codex', {method:'POST', headers:{'Content-Type':'application/json'},
         body: JSON.stringify({project: conv.project, sid: conv.sid})});
       const d = await r.json();
-      if (d.ok) alert(`已在新终端启动 Codex\ncd ${d.cwd}\n上下文: ${d.mdPath}`);
-      else alert('启动失败: ' + (d.error || '未知'));
-    } catch (e) { alert('启动失败: ' + e); }
+      if (d.ok) window.dialog.alert(`已在新终端启动 Codex\ncd ${d.cwd}\n上下文: ${d.mdPath}`, {title:'转移到 Codex'});
+      else window.dialog.alert('启动失败: ' + (d.error || '未知'), {title:'启动失败', danger:true});
+    } catch (e) { window.dialog.alert('启动失败: ' + e, {title:'启动失败', danger:true}); }
   };
   const doDelete = async () => {
-    if (!confirm(`确认永久删除此对话?\n${conv.title}`)) return;
+    const ok = await window.dialog.confirm(
+      `确认永久删除此对话?\n${conv.title}`,
+      {title:'永久删除', danger:true});
+    if (!ok) return;
     const r = await fetch('/api/delete', {method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({project: conv.project, sid: conv.sid})});
     const d = await r.json();
     if (d.ok) { onDeleted && onDeleted(conv.id); onBack(); }
-    else alert('删除失败: ' + d.error);
+    else window.dialog.alert('删除失败: ' + d.error, {title:'删除失败', danger:true});
   };
   const doPin = () => {
     window.APP_STATE_API.togglePin(conv.id);
@@ -148,9 +151,11 @@ const ConversationView = ({ conv, data, onBack, onDeleted }) => {
               </span>
             ))}
             {conv.tags.length === 0 && <span style={{color:'var(--ink-4)', fontSize:12}}>未添加标签</span>}
-            <button className="aside-add-tag" onClick={() => {
+            <button className="aside-add-tag" onClick={async () => {
               const names = tags.map(t => `${t.id} - ${t.name}`).join('\n');
-              const picked = prompt(`选择标签 ID (或输入新名称创建):\n${names}`, '');
+              const picked = await window.dialog.prompt(
+                `选择标签 ID (或输入新名称创建):\n${names}`,
+                {title:'添加标签', defaultValue:'', placeholder:'标签 ID 或新名称'});
               if (!picked) return;
               let id = picked.trim();
               const exists = tags.find(t => t.id === id);

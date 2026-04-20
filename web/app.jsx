@@ -54,12 +54,12 @@ const App = () => {
       const d = await r.json().catch(() => null);
       if (!r.ok || !d || !d.ok) {
         const msg = (d && d.error) || `HTTP ${r.status}`;
-        alert('合并失败: ' + String(msg).slice(0, 400));
+        window.dialog.alert('合并失败: ' + String(msg).slice(0, 400), {title:'合并失败', danger:true});
         return;
       }
-      alert(`已生成合并摘要 (${(d.bytes/1024).toFixed(1)} KB,${d.count} 条)\n保存到:\n${d.path}`);
+      window.dialog.alert(`已生成合并摘要 (${(d.bytes/1024).toFixed(1)} KB,${d.count} 条)\n保存到:\n${d.path}`, {title:'合并完成'});
     } catch (e) {
-      alert('合并异常: ' + e);
+      window.dialog.alert('合并异常: ' + e, {title:'合并异常', danger:true});
     } finally {
       setMerging(false);
     }
@@ -319,6 +319,8 @@ const App = () => {
 
       {preview && <ConvPreviewPopover preview={preview}/>}
 
+      <DialogHost/>
+
       {/* Bulk action bar */}
       <div className={`bulk-bar ${selected.length > 0 ? 'show' : ''}`}>
         <span className="count-pill">已选 {selected.length}</span>
@@ -336,15 +338,21 @@ const App = () => {
             window.open(`/api/export/${encodeURIComponent(c.project)}/${encodeURIComponent(c.sid)}?format=md`);
           }
         }}><Icon name="export" size={13}/> 导出 MD</button>
-        <button onClick={() => {
+        <button onClick={async () => {
           const targets = selected.map(id => {
             const c = data.conversations.find(x => x.id === id);
             return c ? { project: c.project, sid: c.sid } : null;
           }).filter(Boolean);
-          if (confirm(`让 Claude 把这 ${targets.length} 条合并为摘要 Markdown?`)) mergeTargets(targets);
+          const ok = await window.dialog.confirm(
+            `让 Claude 把这 ${targets.length} 条合并为摘要 Markdown?`,
+            {title:'合并摘要', okLabel:'开始合并'});
+          if (ok) mergeTargets(targets);
         }}><Icon name="sparkles" size={13}/> 合并摘要</button>
         <button className="danger" onClick={async () => {
-          if (!confirm(`确认删除选中的 ${selected.length} 条对话?此操作不可恢复。`)) return;
+          const ok = await window.dialog.confirm(
+            `确认删除选中的 ${selected.length} 条对话?\n此操作不可恢复。`,
+            {title:'删除对话', danger:true});
+          if (!ok) return;
           for (const id of selected) {
             const c = data.conversations.find(x => x.id === id); if (!c) continue;
             await fetch('/api/delete', {method:'POST', headers:{'Content-Type':'application/json'},

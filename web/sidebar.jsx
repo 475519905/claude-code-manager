@@ -66,8 +66,8 @@ const Sidebar = ({ view, setView, selectedProject, setSelectedProject, selectedT
       <div className="side-section">
         <div className="side-label">
           <span>标签</span>
-          <button className="add" title="新建标签" onClick={() => {
-            const name = prompt('标签名称?');
+          <button className="add" title="新建标签" onClick={async () => {
+            const name = await window.dialog.prompt('标签名称?', {title:'新建标签', placeholder:'例如 工作 / 学习'});
             if (name && name.trim()) { window.APP_STATE_API.addTag(name.trim()); window.location.reload(); }
           }}><Icon name="plus" size={12}/></button>
         </div>
