@@ -48,7 +48,7 @@ const Sidebar = ({ view, setView, selectedProject, setSelectedProject, selectedT
         <div className="brand-name"><span className="zh">Claude Manager</span></div>
       </div>
 
-      <button className="new-chat-btn" onClick={() => window.location.reload()} title="重新扫描 ~/.claude/projects/">
+      <button className="new-chat-btn" onClick={() => window.refreshAll()} title="重新扫描会话 + 校验 Claude 登录">
         <Icon name="plus" size={14}/>
         <span>刷新数据</span>
         <kbd>⌘R</kbd>
