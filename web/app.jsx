@@ -52,6 +52,7 @@ const App = () => {
       const r = await fetch('/api/merge', {method:'POST', headers:{'Content-Type':'application/json'},
         body: JSON.stringify({ targets })});
       const d = await r.json().catch(() => null);
+      if (await window.handleAuthGate(d)) return;
       if (!r.ok || !d || !d.ok) {
         const msg = (d && d.error) || `HTTP ${r.status}`;
         window.dialog.alert('合并失败: ' + String(msg).slice(0, 400), {title:'合并失败', danger:true});

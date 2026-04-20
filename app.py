@@ -599,6 +599,10 @@ def api_merge():
     if not claude:
         return jsonify({"ok": False, "error": "claude CLI not found"}), 500
 
+    auth = _auth_status()
+    if not auth["ok"]:
+        return _needs_login_response(auth["reason"])
+
     sections = []
     for t in targets[:20]:  # safety cap
         proj, sid = t.get("project", ""), t.get("sid", "")
@@ -664,6 +668,8 @@ def api_codex():
     codex_path = _find_cli("codex")
     if not codex_path:
         return jsonify({"ok": False, "error": "codex CLI not found"}), 500
+    # codex itself doesn't need Claude OAuth, but this endpoint ran
+    # _session_as_markdown which has no network, so no pre-flight required.
 
     prompt = (
         f"参考同目录下 {md_path.name} 中的先前对话,继续帮我推进这个任务。"
@@ -698,6 +704,9 @@ def api_resume():
             break
     if not cwd or not Path(cwd).exists():
         return jsonify({"ok": False, "error": f"cwd not found: {cwd}"}), 400
+    auth = _auth_status()
+    if not auth["ok"]:
+        return _needs_login_response(auth["reason"])
     try:
         if sys.platform.startswith("win"):
             cmd = f'start "" cmd /k "cd /d \"{cwd}\" && claude --resume {sid}"'
@@ -732,6 +741,79 @@ def api_active():
     return jsonify({"active": active, "windowSecs": ACTIVE_WINDOW_SECS})
 
 
+def _read_oauth() -> dict:
+    """Return the claudeAiOauth block from ~/.claude/.credentials.json, or {}."""
+    cred_path = Path.home() / ".claude" / ".credentials.json"
+    if not cred_path.exists():
+        return {}
+    try:
+        with open(cred_path, "r", encoding="utf-8") as f:
+            return (json.load(f) or {}).get("claudeAiOauth") or {}
+    except Exception:
+        return {}
+
+
+def _auth_status(buffer_secs: int = 120) -> dict:
+    """Return {ok, expiresInSec, reason}. ok=False if the token is missing /
+    expired / expiring within `buffer_secs`."""
+    oauth = _read_oauth()
+    if not oauth:
+        return {"ok": False, "reason": "no_credentials", "expiresInSec": None}
+    exp = oauth.get("expiresAt")
+    if not isinstance(exp, (int, float)):
+        return {"ok": False, "reason": "no_expires", "expiresInSec": None}
+    now_ms = time.time() * 1000
+    remaining = (exp - now_ms) / 1000
+    if remaining <= 0:
+        return {"ok": False, "reason": "expired", "expiresInSec": int(remaining)}
+    if remaining < buffer_secs:
+        return {"ok": False, "reason": "expiring", "expiresInSec": int(remaining)}
+    return {"ok": True, "reason": "ok", "expiresInSec": int(remaining)}
+
+
+def _needs_login_response(reason: str):
+    human = {
+        "no_credentials": "未找到 Claude 登录凭证",
+        "no_expires":     "凭证无过期字段,无法校验",
+        "expired":        "Claude 登录已过期",
+        "expiring":       "Claude 登录即将过期",
+    }.get(reason, "Claude 登录需要刷新")
+    return jsonify({
+        "ok": False,
+        "needsLogin": True,
+        "error": human,
+        "reason": reason,
+    }), 401
+
+
+@app.route("/api/auth-status")
+def api_auth_status():
+    return jsonify(_auth_status())
+
+
+@app.route("/api/claude-login", methods=["POST"])
+def api_claude_login():
+    """Spawn a visible terminal running `claude /login` so the user can
+    complete the OAuth flow. Non-blocking."""
+    claude = _find_cli("claude")
+    if not claude:
+        return jsonify({"ok": False, "error": "claude CLI not found"}), 500
+    try:
+        if sys.platform.startswith("win"):
+            # /k keeps the window open after /login returns so user sees the result.
+            cmd = f'start "Claude Login" cmd /k "\"{claude}\" /login"'
+            subprocess.Popen(cmd, shell=True)
+        elif sys.platform == "darwin":
+            script = f'tell app "Terminal" to do script {json.dumps(f"{claude} /login")}'
+            subprocess.Popen(["osascript", "-e", script])
+        else:
+            subprocess.Popen(["x-terminal-emulator", "-e",
+                              f"bash -c '{claude!r} /login; exec bash'"])
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+    return jsonify({"ok": True})
+
+
 @app.route("/api/account")
 def api_account():
     """Return whatever Claude plan info we can glean from ~/.claude/.credentials.json."""
@@ -761,11 +843,13 @@ def api_account():
             expires_iso = datetime.fromtimestamp(expires_at / 1000).strftime("%Y-%m-%d %H:%M")
         except Exception:
             pass
+    auth = _auth_status()
     return jsonify({
         "ok": True,
         "plan": plan_map.get(sub_type, sub_type.title() or "—"),
         "tier": tier_pretty,
         "tokenExpiresAt": expires_iso,
+        "auth": auth,
     })
 
 

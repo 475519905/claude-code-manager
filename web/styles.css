@@ -390,6 +390,26 @@ input, textarea {
   text-overflow: ellipsis;
   margin-top: 1px;
 }
+.auth-warn {
+  display: inline-block;
+  margin-top: 2px;
+  padding: 2px 6px;
+  font-size: 10.5px;
+  color: var(--danger, #ef4444);
+  background: color-mix(in oklch, var(--danger, #ef4444) 12%, transparent);
+  border: 1px solid color-mix(in oklch, var(--danger, #ef4444) 35%, transparent);
+  border-radius: 4px;
+  cursor: pointer;
+  font-family: var(--font-sans);
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+}
+.auth-warn:hover {
+  background: color-mix(in oklch, var(--danger, #ef4444) 20%, transparent);
+}
 
 /* ===================================================================
    Main content

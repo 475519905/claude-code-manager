@@ -17,6 +17,33 @@
     else queue.push(entry);
   });
 
+  // Handle a 401 `{needsLogin: true}` response by offering to re-login.
+  // Returns true iff the caller should abort (login flow was launched OR user
+  // cancelled). Returns false when the response was fine (no login needed).
+  window.handleAuthGate = async (responseJson) => {
+    if (!responseJson || !responseJson.needsLogin) return false;
+    const ok = await window.dialog.confirm(
+      `${responseJson.error || 'Claude 登录已过期'}\n现在打开终端重新登录?`,
+      {title: 'Claude 登录已过期', okLabel: '重新登录', danger: false});
+    if (ok) {
+      try {
+        const r = await fetch('/api/claude-login', {method:'POST'});
+        const d = await r.json();
+        if (!d.ok) {
+          await window.dialog.alert('启动登录失败: ' + (d.error || '未知'),
+            {title:'启动失败', danger:true});
+        } else {
+          await window.dialog.alert(
+            '已打开终端窗口。完成 `claude /login` 后,回到这里再次点击操作即可。',
+            {title:'请在新终端中完成登录'});
+        }
+      } catch (e) {
+        await window.dialog.alert('启动登录失败: ' + e, {title:'启动失败', danger:true});
+      }
+    }
+    return true;
+  };
+
   window.dialog = {
     confirm: (message, opts = {}) => push({
       kind: 'confirm',

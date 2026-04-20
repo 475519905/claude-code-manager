@@ -2,9 +2,31 @@
 const Sidebar = ({ view, setView, selectedProject, setSelectedProject, selectedTag, setSelectedTag, data, counts }) => {
   const [account, setAccount] = React.useState(null);
   const profile = { name: '林知远', email: 'zhihyuan.lin@mail.com' };
-  React.useEffect(() => {
+  const loadAccount = () =>
     fetch('/api/account').then(r => r.json()).then(setAccount).catch(() => {});
+  React.useEffect(() => {
+    loadAccount();
+    // Re-poll every 60s so the expiry warning appears/disappears on its own.
+    const h = setInterval(loadAccount, 60000);
+    return () => clearInterval(h);
   }, []);
+  const authBad = account && account.auth && !account.auth.ok;
+  const onRelogin = async () => {
+    try {
+      const r = await fetch('/api/claude-login', {method:'POST'});
+      const d = await r.json();
+      if (d.ok) {
+        await window.dialog.alert(
+          '已打开终端窗口。完成 `claude /login` 后,点击刷新数据即可。',
+          {title:'请在新终端中完成登录'});
+      } else {
+        await window.dialog.alert('启动登录失败: ' + (d.error || '未知'),
+          {title:'启动失败', danger:true});
+      }
+    } catch (e) {
+      await window.dialog.alert('启动登录失败: ' + e, {title:'启动失败', danger:true});
+    }
+  };
   const navItems = [
     { id: 'all',     label: '所有对话', icon: 'message', count: counts.all },
     { id: 'pinned',  label: '置顶',     icon: 'pin',     count: counts.pinned },
@@ -99,7 +121,13 @@ const Sidebar = ({ view, setView, selectedProject, setSelectedProject, selectedT
         <div className="user-meta">
           <div className="user-name" title={profile.email}>{profile.name}</div>
           <div className="user-plan">Claude Max Plan 20×</div>
-          <div className="user-email" title={profile.email}>{profile.email}</div>
+          {authBad ? (
+            <button className="auth-warn" onClick={onRelogin} title={account?.auth?.reason || ''}>
+              ⚠ {account.auth.reason === 'expired' ? '登录已过期' : 'Claude 登录需要刷新'} · 点此重登
+            </button>
+          ) : (
+            <div className="user-email" title={profile.email}>{profile.email}</div>
+          )}
         </div>
       </div>
     </aside>
