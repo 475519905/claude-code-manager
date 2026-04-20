@@ -6,52 +6,6 @@ const ConversationView = ({ conv, data, onBack, onDeleted }) => {
   const [detail, setDetail] = React.useState(null);
   const [err, setErr] = React.useState('');
 
-  // In-app chat (claude --resume <sid> -p) — bypasses interactive-mode
-  // auto-compaction that some users hit 403 on.
-  const [chatOpen, setChatOpen] = React.useState(false);
-  const [chatInput, setChatInput] = React.useState('');
-  const [chatSending, setChatSending] = React.useState(false);
-  // turns is a local append-only log of {role: 'user'|'assistant'|'error', text}
-  // covering just THIS session of in-app exchanges (not the full jsonl history,
-  // which stays above in .messages).
-  const [turns, setTurns] = React.useState([]);
-  const messagesEndRef = React.useRef(null);
-
-  const reloadMessages = () => {
-    fetch(`/api/session/${encodeURIComponent(conv.project)}/${encodeURIComponent(conv.sid)}`)
-      .then(r => r.ok ? r.json() : Promise.reject(new Error('HTTP '+r.status)))
-      .then(d => { setMessages(d.messages || []); setDetail(d); })
-      .catch(() => {});
-  };
-
-  const sendChat = async () => {
-    const msg = chatInput.trim();
-    if (!msg || chatSending) return;
-    setTurns(t => [...t, {role:'user', text: msg}]);
-    setChatInput('');
-    setChatSending(true);
-    try {
-      const r = await fetch('/api/chat', {method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({project: conv.project, sid: conv.sid, message: msg})});
-      const d = await r.json().catch(() => null);
-      if (await window.handleAuthGate(d)) { setChatSending(false); return; }
-      if (!r.ok || !d || !d.ok) {
-        const emsg = (d && d.error) || `HTTP ${r.status}`;
-        setTurns(t => [...t, {role:'error', text: emsg}]);
-      } else {
-        setTurns(t => [...t, {role:'assistant', text: d.reply || '(无回复)'}]);
-        // Refresh the upper messages list so the new exchange also appears
-        // in the historical view.
-        reloadMessages();
-      }
-    } catch (e) {
-      setTurns(t => [...t, {role:'error', text: String(e)}]);
-    } finally {
-      setChatSending(false);
-      setTimeout(() => messagesEndRef.current?.scrollIntoView({behavior:'smooth'}), 100);
-    }
-  };
-
   React.useEffect(() => {
     let cancel = false;
     setMessages(null); setErr('');
@@ -156,49 +110,7 @@ const ConversationView = ({ conv, data, onBack, onDeleted }) => {
               </div>
             );
           })}
-
-          {turns.length > 0 && (
-            <div className="chat-inapp-log">
-              <div className="chat-inapp-label">本次继续对话 · <code>claude --resume -p</code></div>
-              {turns.map((t, i) => (
-                <div key={i} className={`chat-inapp-turn ${t.role}`}>
-                  <div className="chat-inapp-author">
-                    {t.role === 'user' ? '你' : t.role === 'assistant' ? 'Claude' : '错误'}
-                  </div>
-                  <div className="chat-inapp-body">{t.text}</div>
-                </div>
-              ))}
-              {chatSending && <div className="chat-inapp-turn pending">Claude 思考中…</div>}
-              <div ref={messagesEndRef}/>
-            </div>
-          )}
         </div>
-
-        {chatOpen && (
-          <div className="chat-inapp-dock">
-            <textarea
-              className="chat-inapp-input"
-              value={chatInput}
-              placeholder="接着说… (⌘/Ctrl+Enter 发送,Esc 收起)"
-              rows={3}
-              disabled={chatSending}
-              onChange={(e) => setChatInput(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); sendChat(); }
-                else if (e.key === 'Escape') { e.preventDefault(); setChatOpen(false); }
-              }}
-              autoFocus
-            />
-            <div className="chat-inapp-bar">
-              <span className="chat-inapp-hint">
-                非交互模式,不支持斜杠命令和工具调用,但可绕过交互 compaction 的 403
-              </span>
-              <button className="chat-inapp-send" onClick={sendChat} disabled={chatSending || !chatInput.trim()}>
-                {chatSending ? '发送中…' : '发送'}
-              </button>
-            </div>
-          </div>
-        )}
       </div>
 
       <aside className="detail-aside">
@@ -261,11 +173,8 @@ const ConversationView = ({ conv, data, onBack, onDeleted }) => {
         <div className="aside-section">
           <div className="aside-label">操作</div>
           <div style={{display: 'flex', flexDirection: 'column', gap: 2}}>
-            <button className="nav-item" style={{padding: '8px 12px'}} onClick={() => setChatOpen(v => !v)}>
-              <Icon name="message" size={14}/> {chatOpen ? '收起继续对话' : '继续对话 (应用内)'}
-            </button>
             <button className="nav-item" style={{padding: '8px 12px'}} onClick={doResume}>
-              <Icon name="back" size={14}/> 在新终端继续 (真 resume)
+              <Icon name="message" size={14}/> 继续对话
             </button>
             <button className="nav-item" style={{padding: '8px 12px'}} onClick={doCodex}>
               <Icon name="export" size={14}/> 转移到 Codex

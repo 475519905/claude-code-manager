@@ -691,66 +691,6 @@ def api_codex():
     return jsonify({"ok": True, "cwd": cwd, "mdPath": str(md_path)})
 
 
-@app.route("/api/chat", methods=["POST"])
-def api_chat():
-    """In-app continuation: non-interactively send one message to a resumed
-    session via `claude --resume <sid> -p <msg> --output-format json`.
-
-    This bypasses the interactive-mode auto-compaction that triggers
-    "Request not allowed" 403s for some users, at the cost of losing
-    slash-commands / tool use. The CLI appends the new exchange to the
-    existing jsonl so the conversation view picks it up on refresh.
-    """
-    data = request.get_json(silent=True) or {}
-    project = data.get("project", "")
-    sid = data.get("sid", "")
-    message = (data.get("message") or "").strip()
-    if not message:
-        return jsonify({"ok": False, "error": "empty message"}), 400
-
-    f = _safe_session(project, sid)
-    cwd = ""
-    for obj in _iter_jsonl(f):
-        if obj.get("cwd"):
-            cwd = obj["cwd"]
-            break
-    if not cwd or not Path(cwd).exists():
-        return jsonify({"ok": False, "error": f"cwd not found: {cwd}"}), 400
-
-    claude = _find_cli("claude")
-    if not claude:
-        return jsonify({"ok": False, "error": "claude CLI not found"}), 500
-
-    args = [claude, "--resume", sid, "-p", message,
-            "--output-format", "json"]
-    code, out, err = _run_cli(args, stdin_text="", timeout=300, cwd=cwd)
-    if code != 0:
-        snippet = (err.strip() or out.strip() or "")[:1500]
-        return jsonify({"ok": False,
-                        "error": f"claude exit {code}" + (f": {snippet}" if snippet else "")}), 500
-
-    # claude -p --output-format=json returns a single JSON object like:
-    #   {"type":"result","result":"...","session_id":"...","usage":{...}}
-    reply = ""
-    new_sid = sid
-    usage = None
-    try:
-        parsed = json.loads(out)
-        if isinstance(parsed, dict):
-            reply = parsed.get("result") or ""
-            new_sid = parsed.get("session_id") or sid
-            usage = parsed.get("usage")
-    except Exception:
-        reply = out.strip()
-
-    return jsonify({
-        "ok": True,
-        "reply": reply,
-        "sessionId": new_sid,
-        "usage": usage,
-    })
-
-
 @app.route("/api/resume", methods=["POST"])
 def api_resume():
     data = request.get_json(silent=True) or {}
