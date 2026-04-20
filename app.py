@@ -704,21 +704,24 @@ def api_resume():
             break
     if not cwd or not Path(cwd).exists():
         return jsonify({"ok": False, "error": f"cwd not found: {cwd}"}), 400
-    auth = _auth_status()
-    if not auth["ok"]:
-        return _needs_login_response(auth["reason"])
+    # No pre-flight auth gate here: token validity doesn't predict whether
+    # Anthropic's policy engine will accept the compaction call, and spawning
+    # a terminal that just runs `claude --resume <sid>` is exactly what the
+    # user would type manually — we shouldn't second-guess it.
+    cmdline = f"claude --resume {sid}"
     try:
         if sys.platform.startswith("win"):
-            cmd = f'start "" cmd /k "cd /d \"{cwd}\" && claude --resume {sid}"'
+            cmd = f'start "" cmd /k "cd /d \"{cwd}\" && {cmdline}"'
             subprocess.Popen(cmd, shell=True)
         elif sys.platform == "darwin":
-            script = f'tell app "Terminal" to do script "cd {json.dumps(cwd)} && claude --resume {sid}"'
+            script = f'tell app "Terminal" to do script "cd {json.dumps(cwd)} && {cmdline}"'
             subprocess.Popen(["osascript", "-e", script])
         else:
-            subprocess.Popen(["x-terminal-emulator", "-e", f"bash -c 'cd {cwd!r} && claude --resume {sid}; exec bash'"])
+            subprocess.Popen(["x-terminal-emulator", "-e",
+                              f"bash -c 'cd {cwd!r} && {cmdline}; exec bash'"])
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
-    return jsonify({"ok": True, "cwd": cwd})
+    return jsonify({"ok": True, "cwd": cwd, "command": cmdline})
 
 
 @app.route("/api/active")
