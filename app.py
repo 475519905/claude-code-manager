@@ -713,15 +713,15 @@ def api_new_chat():
             safe_cwd = cwd.replace('"', '\\"')
             cmd = (
                 f'start "" powershell -NoExit -Command '
-                f'"Set-Location -LiteralPath \\"{safe_cwd}\\"; claude"'
+                f'"Set-Location -LiteralPath \\"{safe_cwd}\\""'
             )
             subprocess.Popen(cmd, shell=True)
         elif sys.platform == "darwin":
-            script = f'tell app "Terminal" to do script "cd {json.dumps(cwd)} && claude"'
+            script = f'tell app "Terminal" to do script "cd {json.dumps(cwd)}"'
             subprocess.Popen(["osascript", "-e", script])
         else:
             subprocess.Popen(["x-terminal-emulator", "-e",
-                              f"bash -c 'cd {cwd!r} && claude; exec bash'"])
+                              f"bash -c 'cd {cwd!r}; exec bash'"])
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
     return jsonify({"ok": True, "cwd": cwd})
