@@ -31,8 +31,7 @@ const ConversationView = ({ conv, data, onBack, onDeleted }) => {
         body: JSON.stringify({project: conv.project, sid: conv.sid})});
       const d = await r.json();
       if (await window.handleAuthGate(d)) return;
-      if (d.ok) window.dialog.alert(`已在新终端启动:\ncd ${d.cwd}\n${d.command || ('claude --resume ' + conv.sid)}`, {title:'继续对话'});
-      else window.dialog.alert('启动失败: ' + (d.error || '未知'), {title:'启动失败', danger:true});
+      if (!d.ok) window.dialog.alert('启动失败: ' + (d.error || '未知'), {title:'启动失败', danger:true});
     } catch (e) { window.dialog.alert('启动失败: ' + e, {title:'启动失败', danger:true}); }
   };
   const doNewChat = async () => {
@@ -41,8 +40,7 @@ const ConversationView = ({ conv, data, onBack, onDeleted }) => {
         body: JSON.stringify({project: conv.project, sid: conv.sid})});
       const d = await r.json();
       if (await window.handleAuthGate(d)) return;
-      if (d.ok) window.dialog.alert(`已在新终端启动新对话\ncd ${d.cwd}\n上下文: ${d.mdPath}`, {title:'新建对话'});
-      else window.dialog.alert('启动失败: ' + (d.error || '未知'), {title:'启动失败', danger:true});
+      if (!d.ok) window.dialog.alert('启动失败: ' + (d.error || '未知'), {title:'启动失败', danger:true});
     } catch (e) { window.dialog.alert('启动失败: ' + e, {title:'启动失败', danger:true}); }
   };
   const doCodex = async () => {
