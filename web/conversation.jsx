@@ -64,6 +64,14 @@ const ConversationView = ({ conv, data, onBack, onDeleted }) => {
     if (d.ok) { onDeleted && onDeleted(conv.id); onBack(); }
     else window.dialog.alert('删除失败: ' + d.error, {title:'删除失败', danger:true});
   };
+  const doScrollBottom = () => {
+    const msgs = document.querySelector('.messages');
+    if (msgs && msgs.lastElementChild) {
+      msgs.lastElementChild.scrollIntoView({behavior:'smooth', block:'end'});
+    } else {
+      window.scrollTo({top: document.documentElement.scrollHeight, behavior:'smooth'});
+    }
+  };
   const doPin = () => {
     window.APP_STATE_API.togglePin(conv.id);
     conv.pinned = !conv.pinned;
@@ -204,6 +212,9 @@ const ConversationView = ({ conv, data, onBack, onDeleted }) => {
         <div className="aside-section">
           <div className="aside-label">操作</div>
           <div style={{display: 'flex', flexDirection: 'column', gap: 2}}>
+            <button className="nav-item" style={{padding: '8px 12px'}} onClick={doScrollBottom}>
+              <Icon name="chevronDown" size={14}/> 滚动到底部
+            </button>
             <button className="nav-item" style={{padding: '8px 12px'}} onClick={doResume}>
               <Icon name="message" size={14}/> 继续对话
             </button>
