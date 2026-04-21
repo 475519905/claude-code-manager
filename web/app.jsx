@@ -421,3 +421,10 @@ const App = () => {
 };
 
 ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+requestAnimationFrame(() => {
+  const splash = document.getElementById('cm-splash');
+  if (splash) {
+    splash.classList.add('hide');
+    setTimeout(() => splash.remove(), 300);
+  }
+});
