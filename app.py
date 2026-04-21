@@ -693,35 +693,33 @@ def api_codex():
 
 @app.route("/api/new-chat", methods=["POST"])
 def api_new_chat():
-    """Start a fresh `claude` session in the conversation's cwd, primed with
-    a reference to the exported `_claude_manager_<sid>.md` context file."""
+    """Open a fresh `claude` session in the original conversation's cwd.
+    No --resume, no initial prompt — passing a prompt that references the
+    prior session's md was still hitting Anthropic's 403 policy wall."""
     data = request.get_json(silent=True) or {}
     project = data.get("project", "")
     sid = data.get("sid", "")
-    cwd, md = _session_as_markdown(project, sid)
+    f = _safe_session(project, sid)
+    cwd = ""
+    for obj in _iter_jsonl(f):
+        if obj.get("cwd"):
+            cwd = obj["cwd"]
+            break
     if not cwd or not Path(cwd).exists():
         return jsonify({"ok": False, "error": f"cwd not found: {cwd}"}), 400
-    md_path = Path(cwd) / f"_claude_manager_{sid}.md"
-    try:
-        md_path.write_text(md, encoding="utf-8")
-    except OSError as e:
-        return jsonify({"ok": False, "error": f"write failed: {e}"}), 500
-
-    prompt = f"参考同目录下 {md_path.name} 中的先前对话,继续帮我推进这个任务。"
     try:
         if sys.platform.startswith("win"):
-            safe_prompt = prompt.replace('"', '\\"')
-            cmd = f'start "" cmd /k "cd /d \"{cwd}\" && claude \"{safe_prompt}\""'
+            cmd = f'start "" cmd /k "cd /d \"{cwd}\" && claude"'
             subprocess.Popen(cmd, shell=True)
         elif sys.platform == "darwin":
-            script = f'tell app "Terminal" to do script "cd {json.dumps(cwd)} && claude {json.dumps(prompt)}"'
+            script = f'tell app "Terminal" to do script "cd {json.dumps(cwd)} && claude"'
             subprocess.Popen(["osascript", "-e", script])
         else:
             subprocess.Popen(["x-terminal-emulator", "-e",
-                              f"bash -c 'cd {cwd!r} && claude {json.dumps(prompt)}; exec bash'"])
+                              f"bash -c 'cd {cwd!r} && claude; exec bash'"])
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
-    return jsonify({"ok": True, "cwd": cwd, "mdPath": str(md_path)})
+    return jsonify({"ok": True, "cwd": cwd})
 
 
 @app.route("/api/resume", methods=["POST"])
