@@ -691,6 +691,39 @@ def api_codex():
     return jsonify({"ok": True, "cwd": cwd, "mdPath": str(md_path)})
 
 
+@app.route("/api/new-chat", methods=["POST"])
+def api_new_chat():
+    """Start a fresh `claude` session in the conversation's cwd, primed with
+    a reference to the exported `_claude_manager_<sid>.md` context file."""
+    data = request.get_json(silent=True) or {}
+    project = data.get("project", "")
+    sid = data.get("sid", "")
+    cwd, md = _session_as_markdown(project, sid)
+    if not cwd or not Path(cwd).exists():
+        return jsonify({"ok": False, "error": f"cwd not found: {cwd}"}), 400
+    md_path = Path(cwd) / f"_claude_manager_{sid}.md"
+    try:
+        md_path.write_text(md, encoding="utf-8")
+    except OSError as e:
+        return jsonify({"ok": False, "error": f"write failed: {e}"}), 500
+
+    prompt = f"参考同目录下 {md_path.name} 中的先前对话,继续帮我推进这个任务。"
+    try:
+        if sys.platform.startswith("win"):
+            safe_prompt = prompt.replace('"', '\\"')
+            cmd = f'start "" cmd /k "cd /d \"{cwd}\" && claude \"{safe_prompt}\""'
+            subprocess.Popen(cmd, shell=True)
+        elif sys.platform == "darwin":
+            script = f'tell app "Terminal" to do script "cd {json.dumps(cwd)} && claude {json.dumps(prompt)}"'
+            subprocess.Popen(["osascript", "-e", script])
+        else:
+            subprocess.Popen(["x-terminal-emulator", "-e",
+                              f"bash -c 'cd {cwd!r} && claude {json.dumps(prompt)}; exec bash'"])
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+    return jsonify({"ok": True, "cwd": cwd, "mdPath": str(md_path)})
+
+
 @app.route("/api/resume", methods=["POST"])
 def api_resume():
     data = request.get_json(silent=True) or {}

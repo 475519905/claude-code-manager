@@ -35,6 +35,16 @@ const ConversationView = ({ conv, data, onBack, onDeleted }) => {
       else window.dialog.alert('启动失败: ' + (d.error || '未知'), {title:'启动失败', danger:true});
     } catch (e) { window.dialog.alert('启动失败: ' + e, {title:'启动失败', danger:true}); }
   };
+  const doNewChat = async () => {
+    try {
+      const r = await fetch('/api/new-chat', {method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({project: conv.project, sid: conv.sid})});
+      const d = await r.json();
+      if (await window.handleAuthGate(d)) return;
+      if (d.ok) window.dialog.alert(`已在新终端启动新对话\ncd ${d.cwd}\n上下文: ${d.mdPath}`, {title:'新建对话'});
+      else window.dialog.alert('启动失败: ' + (d.error || '未知'), {title:'启动失败', danger:true});
+    } catch (e) { window.dialog.alert('启动失败: ' + e, {title:'启动失败', danger:true}); }
+  };
   const doCodex = async () => {
     try {
       const r = await fetch('/api/codex', {method:'POST', headers:{'Content-Type':'application/json'},
@@ -134,7 +144,7 @@ const ConversationView = ({ conv, data, onBack, onDeleted }) => {
         <div className="aside-section">
           <div className="aside-label">Session ID</div>
           <div style={{fontFamily:'var(--font-mono)', fontSize: 10.5, color: 'var(--ink-3)', wordBreak: 'break-all'}}>
-            {conv.sid}
+            claude --resume {conv.sid}
           </div>
         </div>
 
@@ -175,6 +185,9 @@ const ConversationView = ({ conv, data, onBack, onDeleted }) => {
           <div style={{display: 'flex', flexDirection: 'column', gap: 2}}>
             <button className="nav-item" style={{padding: '8px 12px'}} onClick={doResume}>
               <Icon name="message" size={14}/> 继续对话
+            </button>
+            <button className="nav-item" style={{padding: '8px 12px'}} onClick={doNewChat}>
+              <Icon name="plus" size={14}/> 新建对话
             </button>
             <button className="nav-item" style={{padding: '8px 12px'}} onClick={doCodex}>
               <Icon name="export" size={14}/> 转移到 Codex
