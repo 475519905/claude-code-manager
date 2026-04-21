@@ -693,9 +693,10 @@ def api_codex():
 
 @app.route("/api/new-chat", methods=["POST"])
 def api_new_chat():
-    """Open a fresh `claude` session in the original conversation's cwd.
-    No --resume, no initial prompt — passing a prompt that references the
-    prior session's md was still hitting Anthropic's 403 policy wall."""
+    """Open a fresh `claude` session. Prefers the original conversation's cwd
+    if it still exists, otherwise falls back to the user's home directory —
+    either way we just pop a terminal and run `claude`, no --resume, no
+    initial prompt (both still trigger Anthropic's 403 policy wall)."""
     data = request.get_json(silent=True) or {}
     project = data.get("project", "")
     sid = data.get("sid", "")
@@ -706,10 +707,14 @@ def api_new_chat():
             cwd = obj["cwd"]
             break
     if not cwd or not Path(cwd).exists():
-        return jsonify({"ok": False, "error": f"cwd not found: {cwd}"}), 400
+        cwd = str(Path.home())
     try:
         if sys.platform.startswith("win"):
-            cmd = f'start "" cmd /k "cd /d \"{cwd}\" && claude"'
+            safe_cwd = cwd.replace('"', '\\"')
+            cmd = (
+                f'start "" powershell -NoExit -Command '
+                f'"Set-Location -LiteralPath \\"{safe_cwd}\\"; claude"'
+            )
             subprocess.Popen(cmd, shell=True)
         elif sys.platform == "darwin":
             script = f'tell app "Terminal" to do script "cd {json.dumps(cwd)} && claude"'
