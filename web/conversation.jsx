@@ -22,6 +22,14 @@ const ConversationView = ({ conv, data, onBack, onDeleted }) => {
 
   const escHtml = (s) => String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 
+  const renderMd = (s) => {
+    const text = String(s || '');
+    try {
+      if (window.marked) return window.marked.parse(text, {breaks: true, gfm: true});
+    } catch {}
+    return escHtml(text).replace(/\n/g, '<br/>');
+  };
+
   const doExport = (fmt) => {
     window.location = `/api/export/${encodeURIComponent(conv.project)}/${encodeURIComponent(conv.sid)}?format=${fmt}`;
   };
@@ -132,7 +140,7 @@ const ConversationView = ({ conv, data, onBack, onDeleted }) => {
                 <div className="msg-avatar">{avatar}</div>
                 <div className="msg-content">
                   <div className="msg-author">{name}{m.model ? ` · ${m.model}` : ''}<span className="msg-time">{ts}</span></div>
-                  <div className="msg-body"><pre style={{whiteSpace:'pre-wrap', wordBreak:'break-word', margin:0, fontFamily:'inherit'}}>{m.text}</pre></div>
+                  <div className="msg-body" dangerouslySetInnerHTML={{__html: renderMd(m.text)}}/>
                 </div>
               </div>
             );
