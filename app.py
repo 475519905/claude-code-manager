@@ -706,7 +706,11 @@ def api_new_chat():
         if obj.get("cwd"):
             cwd = obj["cwd"]
             break
-    if not cwd or not Path(cwd).exists():
+    # Attempt the cd even when the directory is gone — `powershell -NoExit`
+    # keeps the shell open so the user sees the error and can recreate it or
+    # navigate elsewhere. Only fall back to home when the session never
+    # recorded a cwd at all.
+    if not cwd:
         cwd = str(Path.home())
     try:
         if sys.platform.startswith("win"):
