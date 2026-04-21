@@ -1,7 +1,15 @@
 @echo off
 cd /d "%~dp0"
-echo Building ClaudeManager.exe ...
-pyinstaller --onefile --windowed --name ClaudeManager ^
+
+echo ==^> Pre-compiling web/*.jsx -^> web/app.bundle.js
+python build_web.py
+if errorlevel 1 (
+  echo Web build failed.
+  exit /b 1
+)
+
+echo ==^> PyInstaller onedir build
+pyinstaller --windowed --name ClaudeManager ^
   --icon icon.ico ^
   --hidden-import werkzeug.serving ^
   --collect-all webview ^
@@ -9,7 +17,7 @@ pyinstaller --onefile --windowed --name ClaudeManager ^
   --noconfirm --clean ^
   app.py
 if errorlevel 1 (
-  echo Build failed.
+  echo PyInstaller build failed.
   exit /b 1
 )
-echo Done. EXE: dist\ClaudeManager.exe
+echo Done. App folder: dist\ClaudeManager\  (launch ClaudeManager.exe inside)

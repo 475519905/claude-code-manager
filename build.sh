@@ -33,8 +33,14 @@ if [[ ! -f icon.icns ]]; then
   rm -rf "$TMPDIR"
 fi
 
-# 2. Run PyInstaller. Note `:` separator on macOS/Linux (Windows uses `;`).
-pyinstaller --onefile --windowed --name ClaudeManager \
+# 2. Pre-compile web/*.jsx into a single app.bundle.js so the shipped app
+#    doesn't have to run Babel in-browser at startup.
+echo "==> Pre-compiling web/*.jsx -> web/app.bundle.js"
+python3 build_web.py
+
+# 3. Run PyInstaller (onedir, not onefile — onefile unpacks to /tmp on every
+#    launch which costs 2-4s). Note `:` separator on macOS/Linux (Windows uses `;`).
+pyinstaller --windowed --name ClaudeManager \
   --icon icon.icns \
   --hidden-import werkzeug.serving \
   --collect-all webview \
