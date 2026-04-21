@@ -35,6 +35,17 @@ const ConversationView = ({ conv, data, onBack, onDeleted }) => {
     } catch (e) { window.dialog.alert('启动失败: ' + e, {title:'启动失败', danger:true}); }
   };
   const doNewChat = async () => {
+    const resumeCmd = `claude --resume ${conv.sid}`;
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(resumeCmd);
+      } else {
+        const ta = document.createElement('textarea');
+        ta.value = resumeCmd; ta.style.position='fixed'; ta.style.opacity='0';
+        document.body.appendChild(ta); ta.select();
+        document.execCommand('copy'); document.body.removeChild(ta);
+      }
+    } catch {}
     try {
       const r = await fetch('/api/new-chat', {method:'POST', headers:{'Content-Type':'application/json'},
         body: JSON.stringify({project: conv.project, sid: conv.sid})});
