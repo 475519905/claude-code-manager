@@ -716,20 +716,62 @@ def api_new_chat():
             Path(cwd).mkdir(parents=True, exist_ok=True)
         except OSError:
             cwd = str(Path.home())
+    resume_cmd = f"claude --resume {sid}"
     try:
         if sys.platform.startswith("win"):
-            safe_cwd = cwd.replace('"', '\\"')
-            cmd = (
-                f'start "" powershell -NoExit -Command '
-                f'"Set-Location -LiteralPath \\"{safe_cwd}\\""'
+            # Build a small PowerShell bootstrap that:
+            #   1. cd's into the session's cwd
+            #   2. overrides `prompt` so that the first time the REPL is
+            #      about to ask for input, PSReadLine pre-fills the buffer
+            #      with `claude --resume <sid>` — user just hits Enter
+            #   3. restores `prompt` + falls back to Set-Clipboard if
+            #      PSReadLine is unavailable
+            # Passed via -EncodedCommand to avoid quoting hell.
+            import base64 as _b64
+            ps_cwd = "'" + cwd.replace("'", "''") + "'"
+            ps_cmd = "'" + resume_cmd.replace("'", "''") + "'"
+            ps_script = (
+                f"Set-Location -LiteralPath {ps_cwd}\n"
+                f"$global:__cm_preload = {ps_cmd}\n"
+                "$global:__cm_origPrompt = $function:prompt\n"
+                "function prompt {\n"
+                "    $text = & $global:__cm_origPrompt\n"
+                "    if ($global:__cm_preload) {\n"
+                "        try { [Microsoft.PowerShell.PSConsoleReadLine]::Insert($global:__cm_preload) }\n"
+                "        catch { Set-Clipboard -Value $global:__cm_preload }\n"
+                "        $global:__cm_preload = $null\n"
+                "        $function:prompt = $global:__cm_origPrompt\n"
+                "    }\n"
+                "    $text\n"
+                "}\n"
             )
+            encoded = _b64.b64encode(ps_script.encode("utf-16le")).decode("ascii")
+            cmd = f'start "" powershell -NoExit -EncodedCommand {encoded}'
             subprocess.Popen(cmd, shell=True)
         elif sys.platform == "darwin":
-            script = f'tell app "Terminal" to do script "cd {json.dumps(cwd)}"'
+            # Terminal.app has no equivalent of PSReadLine::Insert, so we
+            # send the command as a keystroke after `cd`. User hits Enter
+            # to run; if they don't want it, they Cmd+K the buffer.
+            # `do script` returns before the shell is interactive, so
+            # include a tiny delay inside the script chain.
+            esc_cwd = cwd.replace("\\", "\\\\").replace('"', '\\"')
+            esc_cmd = resume_cmd.replace("\\", "\\\\").replace('"', '\\"')
+            script = (
+                f'tell application "Terminal"\n'
+                f'  activate\n'
+                f'  do script "cd \\"{esc_cwd}\\"; printf \'%s\' \'{esc_cmd}\'"\n'
+                f'end tell'
+            )
             subprocess.Popen(["osascript", "-e", script])
         else:
-            subprocess.Popen(["x-terminal-emulator", "-e",
-                              f"bash -c 'cd {cwd!r}; exec bash'"])
+            # bash: use readline bind to stuff the buffer. Works with
+            # default readline config; falls back cleanly if not.
+            bashrc_line = (
+                f"cd {cwd!r}; "
+                f"bind '\"\\e[0n\": \"{resume_cmd}\"' 2>/dev/null; "
+                f"printf '\\e[5n'; exec bash"
+            )
+            subprocess.Popen(["x-terminal-emulator", "-e", f"bash -c {bashrc_line!r}"])
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
     return jsonify({"ok": True, "cwd": cwd})
