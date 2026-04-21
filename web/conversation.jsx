@@ -160,7 +160,6 @@ const ConversationView = ({ conv, data, onBack, onDeleted }) => {
                     document.body.appendChild(ta); ta.select();
                     document.execCommand('copy'); document.body.removeChild(ta);
                   }
-                  window.dialog.alert('已复制:\n' + text, {title:'已复制'});
                 } catch (e) {
                   window.dialog.alert('复制失败: ' + e, {title:'复制失败', danger:true});
                 }
