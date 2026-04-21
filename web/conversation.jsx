@@ -212,9 +212,6 @@ const ConversationView = ({ conv, data, onBack, onDeleted }) => {
         <div className="aside-section">
           <div className="aside-label">操作</div>
           <div style={{display: 'flex', flexDirection: 'column', gap: 2}}>
-            <button className="nav-item" style={{padding: '8px 12px'}} onClick={doScrollBottom}>
-              <Icon name="chevronDown" size={14}/> 滚动到底部
-            </button>
             <button className="nav-item" style={{padding: '8px 12px'}} onClick={doResume}>
               <Icon name="message" size={14}/> 继续对话
             </button>
@@ -235,6 +232,9 @@ const ConversationView = ({ conv, data, onBack, onDeleted }) => {
             </button>
             <button className="nav-item" style={{padding: '8px 12px', color: 'var(--danger, #ef4444)'}} onClick={doDelete}>
               <Icon name="trash" size={14}/> 永久删除
+            </button>
+            <button className="nav-item" style={{padding: '8px 12px'}} onClick={doScrollBottom}>
+              <Icon name="chevronDown" size={14}/> 滚动到底部
             </button>
           </div>
         </div>
