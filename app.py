@@ -741,43 +741,12 @@ def api_new_chat():
             main_cmd = f'start "" powershell -NoExit -EncodedCommand {_enc(main_script)}'
             subprocess.Popen(main_cmd, shell=True)
 
-            # SendKeys/WM_CHAR gets intercepted by Chinese IME, producing
-            # garbage at the prompt. Use SendInput with KEYEVENTF_UNICODE
-            # instead — Windows delivers each codepoint directly and the
-            # input never passes through the IME pipeline.
+            # SendKeys treats + ^ % ~ ( ) { } [ ] specially — a UUID
+            # contains only hex + hyphens so we don't need to escape.
             helper_script = (
-                "Add-Type -TypeDefinition @'\n"
-                "using System;\n"
-                "using System.Runtime.InteropServices;\n"
-                "public static class U {\n"
-                "  [StructLayout(LayoutKind.Sequential)]\n"
-                "  public struct INPUT {\n"
-                "    public uint type;\n"
-                "    public ushort wVk;\n"
-                "    public ushort wScan;\n"
-                "    public uint dwFlags;\n"
-                "    public uint time;\n"
-                "    public IntPtr dwExtraInfo;\n"
-                "    public IntPtr pad1;\n"
-                "    public IntPtr pad2;\n"
-                "  }\n"
-                "  [DllImport(\"user32.dll\")]\n"
-                "  public static extern uint SendInput(uint n, INPUT[] inputs, int size);\n"
-                "  public static void Type(string text) {\n"
-                "    var arr = new INPUT[text.Length * 2];\n"
-                "    for (int i = 0; i < text.Length; i++) {\n"
-                "      arr[i*2].type = 1;\n"
-                "      arr[i*2].wScan = (ushort)text[i];\n"
-                "      arr[i*2].dwFlags = 0x4;\n"
-                "      arr[i*2+1] = arr[i*2];\n"
-                "      arr[i*2+1].dwFlags = 0x4 | 0x2;\n"
-                "    }\n"
-                "    SendInput((uint)arr.Length, arr, Marshal.SizeOf(typeof(INPUT)));\n"
-                "  }\n"
-                "}\n"
-                "'@\n"
                 "Start-Sleep -Milliseconds 700\n"
-                f"[U]::Type({ps_cmd_lit})\n"
+                "Add-Type -AssemblyName System.Windows.Forms\n"
+                f"[System.Windows.Forms.SendKeys]::SendWait({ps_cmd_lit})\n"
             )
             CREATE_NO_WINDOW = 0x08000000
             subprocess.Popen(
