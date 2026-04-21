@@ -719,41 +719,35 @@ def api_new_chat():
     resume_cmd = f"claude --resume {sid}"
     try:
         if sys.platform.startswith("win"):
-            # Two processes:
-            #   (a) visible PowerShell that just cd's into the session cwd
-            #       and seeds the clipboard as a fallback
-            #   (b) a hidden helper that sleeps ~700ms then uses
-            #       System.Windows.Forms.SendKeys to type the resume
-            #       command into whatever window has focus — which is the
-            #       freshly-launched (a) since it just came to foreground.
-            # Both blocks pass via -EncodedCommand to sidestep cmd/start
-            # quoting and UTF-16 console defaults.
+            # Build a small PowerShell bootstrap that:
+            #   1. cd's into the session's cwd
+            #   2. overrides `prompt` so that the first time the REPL is
+            #      about to ask for input, PSReadLine pre-fills the buffer
+            #      with `claude --resume <sid>` — user just hits Enter
+            #   3. restores `prompt` + falls back to Set-Clipboard if
+            #      PSReadLine is unavailable
+            # Passed via -EncodedCommand to avoid quoting hell.
             import base64 as _b64
-            def _enc(s: str) -> str:
-                return _b64.b64encode(s.encode("utf-16le")).decode("ascii")
             ps_cwd = "'" + cwd.replace("'", "''") + "'"
-            ps_cmd_lit = "'" + resume_cmd.replace("'", "''") + "'"
-
-            main_script = (
+            ps_cmd = "'" + resume_cmd.replace("'", "''") + "'"
+            ps_script = (
                 f"Set-Location -LiteralPath {ps_cwd}\n"
-                f"try {{ Set-Clipboard -Value {ps_cmd_lit} }} catch {{}}\n"
+                f"$global:__cm_preload = {ps_cmd}\n"
+                "$global:__cm_origPrompt = $function:prompt\n"
+                "function prompt {\n"
+                "    $text = & $global:__cm_origPrompt\n"
+                "    if ($global:__cm_preload) {\n"
+                "        try { [Microsoft.PowerShell.PSConsoleReadLine]::Insert($global:__cm_preload) }\n"
+                "        catch { Set-Clipboard -Value $global:__cm_preload }\n"
+                "        $global:__cm_preload = $null\n"
+                "        $function:prompt = $global:__cm_origPrompt\n"
+                "    }\n"
+                "    $text\n"
+                "}\n"
             )
-            main_cmd = f'start "" powershell -NoExit -EncodedCommand {_enc(main_script)}'
-            subprocess.Popen(main_cmd, shell=True)
-
-            # SendKeys treats + ^ % ~ ( ) { } [ ] specially — a UUID
-            # contains only hex + hyphens so we don't need to escape.
-            helper_script = (
-                "Start-Sleep -Milliseconds 700\n"
-                "Add-Type -AssemblyName System.Windows.Forms\n"
-                f"[System.Windows.Forms.SendKeys]::SendWait({ps_cmd_lit})\n"
-            )
-            CREATE_NO_WINDOW = 0x08000000
-            subprocess.Popen(
-                ["powershell", "-WindowStyle", "Hidden",
-                 "-EncodedCommand", _enc(helper_script)],
-                creationflags=CREATE_NO_WINDOW,
-            )
+            encoded = _b64.b64encode(ps_script.encode("utf-16le")).decode("ascii")
+            cmd = f'start "" powershell -NoExit -EncodedCommand {encoded}'
+            subprocess.Popen(cmd, shell=True)
         elif sys.platform == "darwin":
             # Terminal.app has no equivalent of PSReadLine::Insert, so we
             # send the command as a keystroke after `cd`. User hits Enter
