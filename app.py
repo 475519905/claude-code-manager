@@ -719,35 +719,83 @@ def api_new_chat():
     resume_cmd = f"claude --resume {sid}"
     try:
         if sys.platform.startswith("win"):
-            # Build a small PowerShell bootstrap that:
-            #   1. cd's into the session's cwd
-            #   2. overrides `prompt` so that the first time the REPL is
-            #      about to ask for input, PSReadLine pre-fills the buffer
-            #      with `claude --resume <sid>` — user just hits Enter
-            #   3. restores `prompt` + falls back to Set-Clipboard if
-            #      PSReadLine is unavailable
-            # Passed via -EncodedCommand to avoid quoting hell.
+            # Two processes:
+            #   (a) visible PowerShell: cd + put resume command on clipboard
+            #   (b) hidden helper: after 700 ms, move the mouse into the
+            #       centre of the foreground (= the new PowerShell) window
+            #       and send a single right-click. With conhost's QuickEdit
+            #       mode (on by default) a right-click with no selection
+            #       pastes the clipboard into the prompt. IME never sees
+            #       the keystrokes because we never send any.
             import base64 as _b64
+            def _enc(s: str) -> str:
+                return _b64.b64encode(s.encode("utf-16le")).decode("ascii")
             ps_cwd = "'" + cwd.replace("'", "''") + "'"
-            ps_cmd = "'" + resume_cmd.replace("'", "''") + "'"
-            ps_script = (
+            ps_cmd_lit = "'" + resume_cmd.replace("'", "''") + "'"
+
+            main_script = (
                 f"Set-Location -LiteralPath {ps_cwd}\n"
-                f"$global:__cm_preload = {ps_cmd}\n"
-                "$global:__cm_origPrompt = $function:prompt\n"
-                "function prompt {\n"
-                "    $text = & $global:__cm_origPrompt\n"
-                "    if ($global:__cm_preload) {\n"
-                "        try { [Microsoft.PowerShell.PSConsoleReadLine]::Insert($global:__cm_preload) }\n"
-                "        catch { Set-Clipboard -Value $global:__cm_preload }\n"
-                "        $global:__cm_preload = $null\n"
-                "        $function:prompt = $global:__cm_origPrompt\n"
-                "    }\n"
-                "    $text\n"
-                "}\n"
+                f"try {{ Set-Clipboard -Value {ps_cmd_lit} }} catch {{}}\n"
             )
-            encoded = _b64.b64encode(ps_script.encode("utf-16le")).decode("ascii")
-            cmd = f'start "" powershell -NoExit -EncodedCommand {encoded}'
-            subprocess.Popen(cmd, shell=True)
+            subprocess.Popen(
+                f'start "" powershell -NoExit -EncodedCommand {_enc(main_script)}',
+                shell=True,
+            )
+
+            helper_script = (
+                "Add-Type -TypeDefinition @'\n"
+                "using System;\n"
+                "using System.Runtime.InteropServices;\n"
+                "public static class M {\n"
+                "  [StructLayout(LayoutKind.Sequential)]\n"
+                "  public struct RECT { public int L,T,R,B; }\n"
+                "  [StructLayout(LayoutKind.Sequential)]\n"
+                "  public struct POINT { public int X,Y; }\n"
+                "  [StructLayout(LayoutKind.Sequential)]\n"
+                "  public struct INPUT {\n"
+                "    public uint type;\n"
+                "    public int dx; public int dy;\n"
+                "    public uint mouseData; public uint dwFlags; public uint time;\n"
+                "    public IntPtr dwExtraInfo;\n"
+                "    public IntPtr pad1; public IntPtr pad2;\n"
+                "  }\n"
+                "  [DllImport(\"user32.dll\")] public static extern IntPtr GetForegroundWindow();\n"
+                "  [DllImport(\"user32.dll\")] public static extern bool GetWindowRect(IntPtr h, out RECT r);\n"
+                "  [DllImport(\"user32.dll\")] public static extern bool SetCursorPos(int x, int y);\n"
+                "  [DllImport(\"user32.dll\")] public static extern bool GetCursorPos(out POINT p);\n"
+                "  [DllImport(\"user32.dll\")] public static extern uint SendInput(uint n, INPUT[] a, int sz);\n"
+                "  public static void RightClick() {\n"
+                "    var a = new INPUT[2];\n"
+                "    a[0].type = 0; a[0].dwFlags = 0x0008;\n"  # MOUSEEVENTF_RIGHTDOWN
+                "    a[1].type = 0; a[1].dwFlags = 0x0010;\n"  # MOUSEEVENTF_RIGHTUP
+                "    SendInput(2, a, Marshal.SizeOf(typeof(INPUT)));\n"
+                "  }\n"
+                "}\n"
+                "'@\n"
+                "Start-Sleep -Milliseconds 700\n"
+                "$orig = New-Object M+POINT\n"
+                "[M]::GetCursorPos([ref]$orig) | Out-Null\n"
+                "$h = [M]::GetForegroundWindow()\n"
+                "$r = New-Object M+RECT\n"
+                "[M]::GetWindowRect($h, [ref]$r) | Out-Null\n"
+                "$cx = [int](($r.L + $r.R) / 2)\n"
+                # Aim a bit below the midline so we avoid hitting the
+                # scroll bar / title area.
+                "$cy = [int]($r.T + ($r.B - $r.T) * 0.6)\n"
+                "[M]::SetCursorPos($cx, $cy) | Out-Null\n"
+                "Start-Sleep -Milliseconds 40\n"
+                "[M]::RightClick()\n"
+                "Start-Sleep -Milliseconds 60\n"
+                # Restore the user's cursor so the pointer doesn't
+                # visually stick inside the new window.
+                "[M]::SetCursorPos($orig.X, $orig.Y) | Out-Null\n"
+            )
+            CREATE_NO_WINDOW = 0x08000000
+            subprocess.Popen(
+                ["powershell", "-WindowStyle", "Hidden",
+                 "-EncodedCommand", _enc(helper_script)],
+                creationflags=CREATE_NO_WINDOW,
+            )
         elif sys.platform == "darwin":
             # Terminal.app has no equivalent of PSReadLine::Insert, so we
             # send the command as a keystroke after `cd`. User hits Enter
