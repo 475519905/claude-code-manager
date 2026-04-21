@@ -143,8 +143,32 @@ const ConversationView = ({ conv, data, onBack, onDeleted }) => {
 
         <div className="aside-section">
           <div className="aside-label">Session ID</div>
-          <div style={{fontFamily:'var(--font-mono)', fontSize: 10.5, color: 'var(--ink-3)', wordBreak: 'break-all'}}>
-            claude --resume {conv.sid}
+          <div style={{display:'flex', alignItems:'flex-start', gap:6}}>
+            <div style={{flex:1, fontFamily:'var(--font-mono)', fontSize: 10.5, color: 'var(--ink-3)', wordBreak: 'break-all'}}>
+              claude --resume {conv.sid}
+            </div>
+            <button
+              className="chip-btn"
+              title="复制命令"
+              style={{padding:'4px 6px', flex:'0 0 auto'}}
+              onClick={async () => {
+                const text = `claude --resume ${conv.sid}`;
+                try {
+                  if (navigator.clipboard && navigator.clipboard.writeText) {
+                    await navigator.clipboard.writeText(text);
+                  } else {
+                    const ta = document.createElement('textarea');
+                    ta.value = text; ta.style.position='fixed'; ta.style.opacity='0';
+                    document.body.appendChild(ta); ta.select();
+                    document.execCommand('copy'); document.body.removeChild(ta);
+                  }
+                  window.dialog.alert('已复制:\n' + text, {title:'已复制'});
+                } catch (e) {
+                  window.dialog.alert('复制失败: ' + e, {title:'复制失败', danger:true});
+                }
+              }}>
+              <Icon name="copy" size={12}/>
+            </button>
           </div>
         </div>
 
