@@ -3,11 +3,12 @@ const LibraryView = ({ data, onOpen, onPreview, selected, setSelected, viewMode,
   const { conversations, projects, tags } = data;
 
   // Scope filtering
-  let filtered = conversations;
-  if (scope.view === 'pinned') filtered = filtered.filter(c => c.pinned);
-  else if (scope.view === 'archive') filtered = filtered.filter(c => c.tags.includes('archive'));
-  else if (scope.view === 'recent') filtered = filtered.slice().sort((a,b) => b.updatedSort - a.updatedSort).slice(0, 8);
-  else if (scope.view === 'tag' && scope.selectedTag) filtered = filtered.filter(c => c.tags.includes(scope.selectedTag));
+  const visibleConversations = conversations.filter(c => !c.tags.includes('archive'));
+  let filtered = visibleConversations;
+  if (scope.view === 'pinned') filtered = visibleConversations.filter(c => c.pinned);
+  else if (scope.view === 'archive') filtered = conversations.filter(c => c.tags.includes('archive'));
+  else if (scope.view === 'recent') filtered = visibleConversations.slice().sort((a,b) => b.updatedSort - a.updatedSort).slice(0, 8);
+  else if (scope.view === 'tag' && scope.selectedTag) filtered = conversations.filter(c => c.tags.includes(scope.selectedTag));
 
   // Filter chips
   if (filter === 'pinned') filtered = filtered.filter(c => c.pinned);
@@ -26,7 +27,7 @@ const LibraryView = ({ data, onOpen, onPreview, selected, setSelected, viewMode,
   };
 
   const titleMap = {
-    all:     { title: '所有对话',  sub: '浏览并整理你与 Claude 的全部对话' },
+    all:     { title: '所有对话',  sub: '浏览并整理你与 Codex 的全部对话' },
     pinned:  { title: '置顶',     sub: '固定在顶部的重要对话' },
     recent:  { title: '最近',     sub: '按最近活跃时间排序' },
     archive: { title: '归档',     sub: '已归档的对话 — 不显示在主列表中' },
@@ -53,7 +54,7 @@ const LibraryView = ({ data, onOpen, onPreview, selected, setSelected, viewMode,
         <button
           className={`chip-btn ${filter === 'all' ? 'active' : ''}`}
           onClick={() => setFilter('all')}
-        >全部 <span className="count">{conversations.length}</span></button>
+        >全部 <span className="count">{visibleConversations.length}</span></button>
         <button
           className={`chip-btn ${filter === 'pinned' ? 'active' : ''}`}
           onClick={() => setFilter('pinned')}

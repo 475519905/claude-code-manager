@@ -2,7 +2,7 @@
 
 const ProjectView = ({ project, data, onOpen, selected = [], setSelected = () => {}, onPreview }) => {
   const { conversations, projects, tags } = data;
-  const convs = conversations.filter(c => c.project === project.id);
+  const convs = conversations.filter(c => c.project === project.id && !c.tags.includes('archive'));
   const totalTokens = convs.reduce((s, c) => s + c.tokens, 0);
   const [tab, setTab] = React.useState('conversations');
   const toggleSelect = (id) => {
@@ -93,7 +93,7 @@ const ProjectView = ({ project, data, onOpen, selected = [], setSelected = () =>
           <div className="settings-group">
             <div className="settings-group-head">
               <h3>项目路径</h3>
-              <p>项目由 Claude Code 根据工作目录自动生成。</p>
+              <p>项目由 Codex 根据工作目录自动生成。</p>
             </div>
             <div className="setting-row">
               <div className="setting-label"><div className="name">工作目录</div></div>
@@ -125,9 +125,10 @@ const SearchView = ({ data, query, setQuery, onOpen }) => {
   const [deepHits, setDeepHits] = React.useState({});
 
   React.useEffect(() => {
-    if (!q) { setDeepHits({}); return; }
+    if (!q || q.length < 2) { setDeepHits({}); return; }
+    const ctrl = new AbortController();
     const t = setTimeout(() => {
-      fetch('/api/search?q=' + encodeURIComponent(q))
+      fetch('/api/search?q=' + encodeURIComponent(q), {signal: ctrl.signal})
         .then(r => r.json())
         .then(d => {
           const by = {};
@@ -135,7 +136,7 @@ const SearchView = ({ data, query, setQuery, onOpen }) => {
           setDeepHits(by);
         }).catch(() => {});
     }, 200);
-    return () => clearTimeout(t);
+    return () => { clearTimeout(t); ctrl.abort(); };
   }, [q]);
 
   const results = q
@@ -188,7 +189,7 @@ const SearchView = ({ data, query, setQuery, onOpen }) => {
           <div style={{fontFamily: 'var(--font-serif)', fontSize: 17, color: 'var(--ink-2)', marginBottom: 6}}>开始搜索</div>
           <div style={{fontSize: 12.5, color: 'var(--ink-3)'}}>在所有对话中按标题、内容、标签或项目进行搜索</div>
           <div style={{marginTop: 28, display: 'flex', gap: 8, justifyContent: 'center', flexWrap: 'wrap'}}>
-            {['claude', 'python', 'error', 'git', '代码'].map(q2 => (
+            {['codex', 'python', 'error', 'git', '代码'].map(q2 => (
               <button key={q2} className="chip-btn" onClick={() => setQuery(q2)}>
                 <Icon name="search" size={10}/> {q2}
               </button>
@@ -231,8 +232,17 @@ const SearchView = ({ data, query, setQuery, onOpen }) => {
   );
 };
 
-const SettingsView = ({ theme, setTheme, accent, setAccent, density, setDensity }) => {
+const SettingsView = ({ theme, setTheme, accent, setAccent, density, setDensity, prefs = {}, setPrefs = () => {} }) => {
   const [section, setSection] = React.useState('appearance');
+  const Toggle = ({ on, onChange }) => (
+    <div
+      className={`toggle ${on ? 'on' : ''}`}
+      onClick={() => onChange(!on)}
+      style={{ cursor: 'pointer' }}
+      role="switch"
+      aria-checked={!!on}
+    />
+  );
   return (
     <div className="page">
       <div className="page-header">
@@ -299,7 +309,7 @@ const SettingsView = ({ theme, setTheme, accent, setAccent, density, setDensity 
                     <div className="name">跟随系统</div>
                     <div className="desc">根据系统的浅色/深色模式自动切换</div>
                   </div>
-                  <div className="toggle"/>
+                  <Toggle on={!!prefs.followSystem} onChange={(v) => setPrefs({ followSystem: v })}/>
                 </div>
               </div>
 
@@ -334,19 +344,26 @@ const SettingsView = ({ theme, setTheme, accent, setAccent, density, setDensity 
                 <h3>通用</h3>
               </div>
               {[
-                { name: '自动归档 30 天未活跃的对话', desc: '不会删除,可在归档中找到', on: true },
-                { name: '新对话默认置顶',              desc: '创建后固定在列表顶部',       on: false },
-                { name: '在侧边栏显示 token 用量',   desc: '个人资料下方显示本月消耗',   on: true },
-                { name: '发送使用数据以改进产品',     desc: '匿名、可随时关闭',           on: false },
-              ].map((r, i) => (
-                <div key={i} className="setting-row">
-                  <div className="setting-label">
-                    <div className="name">{r.name}</div>
-                    <div className="desc">{r.desc}</div>
+                { key: 'autoArchive',       name: '自动归档 30 天未活跃的对话', desc: '不会删除,可在归档中找到',       dflt: false, reload: true },
+                { key: 'newPinned',         name: '新对话默认置顶',              desc: '创建后固定在列表顶部',           dflt: false, reload: false },
+                { key: 'sessionEndNotify',  name: '对话结束时弹出通知',          desc: 'Windows 右下角弹窗提醒',          dflt: true,  reload: false },
+                { key: 'telemetry',         name: '发送使用数据以改进产品',      desc: '匿名、可随时关闭',                dflt: false, reload: false },
+              ].map((r) => {
+                const cur = prefs[r.key];
+                const on = (cur === undefined) ? r.dflt : !!cur;
+                return (
+                  <div key={r.key} className="setting-row">
+                    <div className="setting-label">
+                      <div className="name">{r.name}</div>
+                      <div className="desc">{r.desc}</div>
+                    </div>
+                    <Toggle on={on} onChange={(v) => {
+                      setPrefs({ [r.key]: v });
+                      if (r.reload) setTimeout(() => window.location.reload(), 80);
+                    }}/>
                   </div>
-                  <div className={`toggle ${r.on ? 'on' : ''}`}/>
-                </div>
-              ))}
+                );
+              })}
             </div>
           )}
 

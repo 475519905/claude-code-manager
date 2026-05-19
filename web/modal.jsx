@@ -17,6 +17,17 @@
     else queue.push(entry);
   });
 
+  const forceRefresh = async () => {
+    try {
+      const r = await fetch('/api/refresh', {method:'POST'});
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok || d.ok === false) throw new Error(d.error || `HTTP ${r.status}`);
+    } catch (e) {
+      console.warn('Failed to refresh session index', e);
+    }
+    window.location.reload();
+  };
+
   // One-shot: probe /api/auth-status, offer re-login if bad, poll until
   // the CLI flow completes, then reload the page. Used by the sidebar's
   // "刷新数据" button so the refresh also repairs OAuth.
@@ -26,26 +37,24 @@
     catch { status = null; }
 
     if (status && status.ok) {
-      window.location.reload();
+      await forceRefresh();
       return;
     }
 
     const reason = (status && status.reason) || 'unknown';
-    const msg = reason === 'expired'        ? 'Claude 登录已过期。'
-             : reason === 'expiring'        ? 'Claude 登录即将过期。'
-             : reason === 'no_credentials'  ? '未找到 Claude 登录凭证。'
-             : 'Claude 登录需要刷新。';
+    const msg = reason === 'no_credentials' ? '未找到 Codex 登录凭证。'
+             : 'Codex 登录需要刷新。';
     const ok = await window.dialog.confirm(
       `${msg}\n现在打开终端完成登录,完成后会自动刷新数据。`,
       {title: '刷新数据', okLabel: '打开登录终端'});
     if (!ok) {
       // User declined — still reload the scan, they can re-login later.
-      window.location.reload();
+      await forceRefresh();
       return;
     }
 
     try {
-      const r = await fetch('/api/claude-login', {method:'POST'});
+      const r = await fetch('/api/codex-login', {method:'POST'});
       const d = await r.json();
       if (!d.ok) {
         await window.dialog.alert('启动登录失败: ' + (d.error || '未知'),
@@ -63,7 +72,7 @@
     const waitSpec = {
       kind: 'alert',
       title: '等待登录完成…',
-      message: '请在刚打开的终端里完成 `claude /login`。\n完成后界面会自动刷新。',
+      message: '请在刚打开的终端里完成 `codex login`。\n完成后界面会自动刷新。',
       okLabel: '取消',
       _resolve: () => { cancelled = true; },
       _done: false,
@@ -80,7 +89,7 @@
             waitSpec._done = true;
             if (notify) notify(null); // close dialog
           }
-          window.location.reload();
+          await forceRefresh();
           return;
         }
       } catch {}
@@ -101,18 +110,18 @@
   window.handleAuthGate = async (responseJson) => {
     if (!responseJson || !responseJson.needsLogin) return false;
     const ok = await window.dialog.confirm(
-      `${responseJson.error || 'Claude 登录已过期'}\n现在打开终端重新登录?`,
-      {title: 'Claude 登录已过期', okLabel: '重新登录', danger: false});
+      `${responseJson.error || 'Codex 登录需要刷新'}\n现在打开终端重新登录?`,
+      {title: 'Codex 登录', okLabel: '重新登录', danger: false});
     if (ok) {
       try {
-        const r = await fetch('/api/claude-login', {method:'POST'});
+        const r = await fetch('/api/codex-login', {method:'POST'});
         const d = await r.json();
         if (!d.ok) {
           await window.dialog.alert('启动登录失败: ' + (d.error || '未知'),
             {title:'启动失败', danger:true});
         } else {
           await window.dialog.alert(
-            '已打开终端窗口。完成 `claude /login` 后,回到这里再次点击操作即可。',
+            '已打开终端窗口。完成 `codex login` 后,回到这里再次点击操作即可。',
             {title:'请在新终端中完成登录'});
         }
       } catch (e) {

@@ -9,7 +9,7 @@ if errorlevel 1 (
 )
 
 echo ==^> PyInstaller onedir build
-pyinstaller --windowed --name ClaudeManager ^
+pyinstaller --windowed --name CodexManager ^
   --icon icon.ico ^
   --hidden-import werkzeug.serving ^
   --collect-all webview ^
@@ -20,4 +20,8 @@ if errorlevel 1 (
   echo PyInstaller build failed.
   exit /b 1
 )
-echo Done. App folder: dist\ClaudeManager\  (launch ClaudeManager.exe inside)
+if exist "Codex.exe" (
+  echo ==^> Copy sidecar Codex.exe
+  copy /Y "Codex.exe" "dist\CodexManager\Codex.exe" >nul
+)
+echo Done. App folder: dist\CodexManager\  (launch CodexManager.exe inside)

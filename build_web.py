@@ -27,6 +27,7 @@ FILES = [
     "usage_panel.jsx",
     "library.jsx",
     "conversation.jsx",
+    "costs.jsx",
     "other_views.jsx",
     "app.jsx",
 ]

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build ClaudeManager.app on macOS.
+# Build CodexManager.app on macOS.
 #
 # Requirements:
 #   - Python 3.10+  (brew install python)
@@ -7,12 +7,12 @@
 #   - macOS built-ins `sips` and `iconutil` (used to build icon.icns from web/icon.png)
 #
 # Output:
-#   dist/ClaudeManager.app   (drag into /Applications)
+#   dist/CodexManager.app   (drag into /Applications)
 
 set -euo pipefail
 cd "$(dirname "$0")"
 
-echo "==> Building ClaudeManager.app"
+echo "==> Building CodexManager.app"
 
 # 1. Make an .icns from web/icon.png if we don't already have one.
 if [[ ! -f icon.icns ]]; then
@@ -40,14 +40,14 @@ python3 build_web.py
 
 # 3. Run PyInstaller (onedir, not onefile — onefile unpacks to /tmp on every
 #    launch which costs 2-4s). Note `:` separator on macOS/Linux (Windows uses `;`).
-pyinstaller --windowed --name ClaudeManager \
+pyinstaller --windowed --name CodexManager \
   --icon icon.icns \
   --hidden-import werkzeug.serving \
   --collect-all webview \
   --add-data "web:web" \
-  --osx-bundle-identifier com.claudemanager.app \
+  --osx-bundle-identifier com.codexmanager.app \
   --noconfirm --clean \
   app.py
 
-echo "==> Done. App bundle: dist/ClaudeManager.app"
-echo "    (the raw binary is dist/ClaudeManager — launch the .app, not the binary)"
+echo "==> Done. App bundle: dist/CodexManager.app"
+echo "    (the raw binary is dist/CodexManager — launch the .app, not the binary)"

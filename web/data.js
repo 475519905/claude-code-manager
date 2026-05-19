@@ -61,12 +61,40 @@
 
   const pinned = new Set(loadLocal('cm.pinned', []));
   const tagMap = loadLocal('cm.tagMap', {});
+  const titleMap = loadLocal('cm.titleMap', {});
   const customTags = loadLocal('cm.tags', [
     { id: 'important', name: '重要', color: 1, count: 0 },
     { id: 'reference', name: '参考', color: 4, count: 0 },
     { id: 'todo',      name: '待办', color: 5, count: 0 },
     { id: 'archive',   name: '归档', color: 6, count: 0 },
   ]);
+
+  const prefs = loadLocal('cm.prefs', {});
+  const seenIds = new Set(loadLocal('cm.seenIds', []));
+  const NOW = Date.now();
+  const STALE_MS = 30 * 86400 * 1000;
+  let pinnedDirty = false, tagsDirty = false, seenDirty = false;
+  for (const s of raw.sessions) {
+    const cid = `${s.project}|${s.sid}`;
+    if (!seenIds.has(cid)) {
+      // brand-new conversation
+      if (prefs.newPinned && !pinned.has(cid)) { pinned.add(cid); pinnedDirty = true; }
+      seenIds.add(cid); seenDirty = true;
+    }
+    if (prefs.autoArchive) {
+      const mtime = (s.mtime || 0) * 1000;
+      if (mtime && (NOW - mtime) > STALE_MS) {
+        const cur = tagMap[cid] || [];
+        if (!cur.includes('archive')) {
+          tagMap[cid] = [...cur, 'archive'];
+          tagsDirty = true;
+        }
+      }
+    }
+  }
+  if (pinnedDirty) localStorage.setItem('cm.pinned', JSON.stringify([...pinned]));
+  if (tagsDirty)   localStorage.setItem('cm.tagMap', JSON.stringify(tagMap));
+  if (seenDirty)   localStorage.setItem('cm.seenIds', JSON.stringify([...seenIds]));
 
   const projects = raw.projects.map(p => {
     const cwdSample = cwdByProj[p.name] || '';
@@ -89,7 +117,8 @@
     const userTags = tagMap[convId] || [];
     const isPinned = pinned.has(convId);
     const msgCount = (s.userCount || 0) + (s.assistantCount || 0);
-    const title = (s.summary || s.preview || '(无标题)').slice(0, 120);
+    const generatedTitle = (s.summary || s.preview || '(无标题)').slice(0, 120);
+    const title = (titleMap[convId] || generatedTitle).slice(0, 120);
     const snippet = (s.preview || s.summary || '').slice(0, 200);
     const spark = [];
     const steps = Math.min(12, Math.max(2, msgCount));
@@ -99,6 +128,7 @@
       project: s.project,
       sid: s.sid,
       title,
+      originalTitle: generatedTitle,
       snippet,
       tags: userTags.slice(),
       updated: relTime(s.lastTs),
@@ -106,7 +136,7 @@
       messages: msgCount,
       tokens: Math.round((s.size || 0) / 4),
       pinned: isPinned,
-      model: '',
+      model: s.model || '',
       created: dateOnly(s.firstTs),
       sparkline: spark,
       cwd: s.cwd,
@@ -121,6 +151,10 @@
   const tagCounts = {};
   for (const c of conversations) for (const t of c.tags) tagCounts[t] = (tagCounts[t] || 0) + 1;
   const tags = customTags.map(t => ({ ...t, count: tagCounts[t.id] || 0 }));
+  const visibleProjects = projects.map(p => ({
+    ...p,
+    convs: conversations.filter(c => c.project === p.id && !c.tags.includes('archive')).length,
+  }));
 
   window.APP_STATE_API = {
     togglePin(convId) {
@@ -131,6 +165,23 @@
       if (!tagIds || !tagIds.length) delete tagMap[convId]; else tagMap[convId] = tagIds;
       localStorage.setItem('cm.tagMap', JSON.stringify(tagMap));
     },
+    archiveConversations(convIds, archived = true) {
+      for (const convId of convIds || []) {
+        const cur = tagMap[convId] || [];
+        const next = archived
+          ? Array.from(new Set([...cur, 'archive']))
+          : cur.filter(t => t !== 'archive');
+        if (next.length) tagMap[convId] = next;
+        else delete tagMap[convId];
+      }
+      localStorage.setItem('cm.tagMap', JSON.stringify(tagMap));
+    },
+    renameConversation(convId, title) {
+      const next = String(title || '').trim();
+      if (!next) delete titleMap[convId];
+      else titleMap[convId] = next.slice(0, 120);
+      localStorage.setItem('cm.titleMap', JSON.stringify(titleMap));
+    },
     addTag(name) {
       const id = 't_' + Date.now();
       const color = ((customTags.length) % 6) + 1;
@@ -140,5 +191,5 @@
     },
   };
 
-  window.APP_DATA = { projects, tags, conversations, sampleDialogue: [] };
+  window.APP_DATA = { projects: visibleProjects, tags, conversations, sampleDialogue: [] };
 })();

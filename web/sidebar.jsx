@@ -1,7 +1,10 @@
 // Sidebar component
 const Sidebar = ({ view, setView, selectedProject, setSelectedProject, selectedTag, setSelectedTag, data, counts }) => {
   const [account, setAccount] = React.useState(null);
-  const profile = { name: '林知远', email: 'zhihyuan.lin@mail.com' };
+  const profile = {
+    name: account?.name || 'Codex',
+    email: account?.email || 'local Codex',
+  };
   const loadAccount = () =>
     fetch('/api/account').then(r => r.json()).then(setAccount).catch(() => {});
   React.useEffect(() => {
@@ -11,13 +14,29 @@ const Sidebar = ({ view, setView, selectedProject, setSelectedProject, selectedT
     return () => clearInterval(h);
   }, []);
   const authBad = account && account.auth && !account.auth.ok;
+  const [newChatBusy, setNewChatBusy] = React.useState(false);
+  const onNewChat = React.useCallback(async () => {
+    if (newChatBusy) return;
+    setNewChatBusy(true);
+    try {
+      const r = await fetch('/api/new-chat', {method:'POST'});
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok || !d.ok) {
+        await window.dialog.alert('启动失败: ' + (d.error || `HTTP ${r.status}`), {title:'新建对话失败', danger:true});
+      }
+    } catch (e) {
+      await window.dialog.alert('启动失败: ' + e, {title:'新建对话失败', danger:true});
+    } finally {
+      setTimeout(() => setNewChatBusy(false), 1500);
+    }
+  }, [newChatBusy]);
   const onRelogin = async () => {
     try {
-      const r = await fetch('/api/claude-login', {method:'POST'});
+      const r = await fetch('/api/codex-login', {method:'POST'});
       const d = await r.json();
       if (d.ok) {
         await window.dialog.alert(
-          '已打开终端窗口。完成 `claude /login` 后,点击刷新数据即可。',
+          '已打开终端窗口。完成 `codex login` 后,点击刷新数据即可。',
           {title:'请在新终端中完成登录'});
       } else {
         await window.dialog.alert('启动登录失败: ' + (d.error || '未知'),
@@ -28,10 +47,11 @@ const Sidebar = ({ view, setView, selectedProject, setSelectedProject, selectedT
     }
   };
   const navItems = [
-    { id: 'all',     label: '所有对话', icon: 'message', count: counts.all },
-    { id: 'pinned',  label: '置顶',     icon: 'pin',     count: counts.pinned },
-    { id: 'recent',  label: '最近',     icon: 'clock',   count: counts.recent },
-    { id: 'archive', label: '归档',     icon: 'archive', count: counts.archive },
+    { id: 'all',     label: '所有对话', icon: 'message',  count: counts.all },
+    { id: 'pinned',  label: '置顶',     icon: 'pin',      count: counts.pinned },
+    { id: 'recent',  label: '最近',     icon: 'clock',    count: counts.recent },
+    { id: 'archive', label: '归档',     icon: 'archive',  count: counts.archive },
+    { id: 'costs',   label: '用量',     icon: 'sparkles' },
   ];
 
   const go = (v, extra = {}) => {
@@ -45,13 +65,12 @@ const Sidebar = ({ view, setView, selectedProject, setSelectedProject, selectedT
     <aside className="sidebar">
       <div className="brand">
         <img className="brand-mark" src="/icon.png" alt="" draggable="false"/>
-        <div className="brand-name"><span className="zh">Claude Manager</span></div>
+        <div className="brand-name"><span className="zh">Codex Manager</span></div>
       </div>
 
-      <button className="new-chat-btn" onClick={() => window.refreshAll()} title="重新扫描会话 + 校验 Claude 登录">
+      <button className="new-chat-btn" onClick={onNewChat} disabled={newChatBusy} title="新建对话">
         <Icon name="plus" size={14}/>
-        <span>刷新数据</span>
-        <kbd>⌘R</kbd>
+        <span>{newChatBusy ? '启动中' : '新建对话'}</span>
       </button>
 
       <div className="side-section">
@@ -120,10 +139,10 @@ const Sidebar = ({ view, setView, selectedProject, setSelectedProject, selectedT
         <div className="avatar">{profile.name.charAt(0)}</div>
         <div className="user-meta">
           <div className="user-name" title={profile.email}>{profile.name}</div>
-          <div className="user-plan">Claude Max Plan 20×</div>
+          <div className="user-plan">{account?.plan || 'Codex'}{account?.tier ? ` · ${account.tier}` : ''}</div>
           {authBad ? (
             <button className="auth-warn" onClick={onRelogin} title={account?.auth?.reason || ''}>
-              ⚠ {account.auth.reason === 'expired' ? '登录已过期' : 'Claude 登录需要刷新'} · 点此重登
+              ⚠ Codex 登录需要刷新 · 点此重登
             </button>
           ) : (
             <div className="user-email" title={profile.email}>{profile.email}</div>

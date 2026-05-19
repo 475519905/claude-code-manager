@@ -1,5 +1,5 @@
 /* ===================================================================
-   Claude 对话管理器 — design tokens & base styles
+   Codex 对话管理器 — design tokens & base styles
    =================================================================== */
 
 .assistant-status {
@@ -767,6 +767,8 @@ input, textarea {
 .heatmap-seg button {
   padding: 4px 10px;
   font-size: 11px;
+  min-width: 42px;
+  white-space: nowrap;
 }
 
 .heatmap-wrap {
@@ -1093,6 +1095,9 @@ input, textarea {
   font-size: 11.5px;
   color: var(--ink-3);
   text-align: right;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .conv-row .check {
@@ -1202,6 +1207,63 @@ input, textarea {
 }
 .detail-meta .sep { color: var(--ink-4); }
 
+.detail-find {
+  position: fixed;
+  top: 76px;
+  right: 28px;
+  z-index: 260;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto auto auto auto;
+  align-items: center;
+  gap: 8px;
+  width: min(420px, calc(100vw - 32px));
+  margin: 0;
+  padding: 8px 10px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  box-shadow: 0 12px 36px rgba(0,0,0,0.16);
+}
+
+.detail-find > svg {
+  color: var(--ink-3);
+}
+
+.detail-find input {
+  min-width: 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--ink);
+  font: 13px/1.4 var(--font-sans);
+}
+
+.detail-find .find-count {
+  min-width: 44px;
+  text-align: right;
+  color: var(--ink-3);
+  font: 11px/1.4 var(--font-mono);
+}
+
+.detail-find button {
+  width: 26px;
+  height: 26px;
+  display: grid;
+  place-items: center;
+  color: var(--ink-3);
+  border-radius: 5px;
+}
+
+.detail-find button:hover:not(:disabled) {
+  background: var(--bg-sunk);
+  color: var(--ink);
+}
+
+.detail-find button:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
 .messages {
   display: flex;
   flex-direction: column;
@@ -1213,6 +1275,25 @@ input, textarea {
   grid-template-columns: 32px 1fr;
   gap: 14px;
   align-items: flex-start;
+  border-radius: 8px;
+  transition: background 0.15s ease, box-shadow 0.15s ease;
+}
+
+.msg.search-active {
+  background: color-mix(in oklch, var(--accent-soft) 38%, transparent);
+  box-shadow: 0 0 0 8px color-mix(in oklch, var(--accent-soft) 38%, transparent);
+}
+
+.conv-find-mark {
+  background: oklch(86% 0.14 85 / 0.8);
+  color: var(--ink);
+  border-radius: 3px;
+  padding: 0 2px;
+}
+
+.search-active .conv-find-mark {
+  background: var(--accent);
+  color: white;
 }
 
 .msg-avatar {
@@ -1860,6 +1941,7 @@ select.text-input {
   background: var(--bg-sunk);
   border-radius: var(--radius-sm);
   padding: 2px;
+  flex: 0 0 auto;
 }
 .seg button {
   flex: 1;
@@ -1868,6 +1950,8 @@ select.text-input {
   color: var(--ink-3);
   border-radius: 4px;
   text-align: center;
+  min-width: max-content;
+  white-space: nowrap;
 }
 .seg button.active {
   background: var(--bg-elevated);
@@ -1945,6 +2029,53 @@ select.text-input {
   overflow: auto;
 }
 .cm-modal-line { white-space: pre-wrap; }
+
+.tag-picker-modal { max-width: 420px; }
+.tag-picker-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 300px;
+  overflow: auto;
+  margin: 4px 0 14px;
+}
+.tag-picker-option {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-sunk);
+  color: var(--ink);
+  text-align: left;
+}
+.tag-picker-option:hover {
+  border-color: var(--accent);
+  background: var(--bg-elevated);
+}
+.tag-picker-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.tag-picker-count { color: var(--ink-4); font-size: 11px; font-family: var(--font-mono); }
+
+.cwd-open-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: 26px;
+  height: 23px;
+  margin-top: 5px;
+  padding: 4px 6px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--ink-3);
+  background: var(--bg-elevated);
+}
+.cwd-open-icon:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
 
 .cm-modal-input {
   width: 100%;
