@@ -20,4 +20,8 @@ if errorlevel 1 (
   echo PyInstaller build failed.
   exit /b 1
 )
+if exist "Claude.exe" (
+  echo ==^> Copy sidecar Claude.exe
+  copy /Y "Claude.exe" "dist\ClaudeManager\Claude.exe" >nul
+)
 echo Done. App folder: dist\ClaudeManager\  (launch ClaudeManager.exe inside)

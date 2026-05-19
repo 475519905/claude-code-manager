@@ -25,12 +25,18 @@ const UsagePanel = () => {
     return Array.from({length:7}, () => Array(weeks).fill(0));
   }, [apiStats]);
 
+  const planLabel = (label) => ({
+    '本月会话': '本月活跃',
+    '累计会话': '历史会话',
+    '短周期额度': '本月活跃',
+    '长周期额度': '历史会话',
+  }[label] || label);
   const plans = (apiStats && apiStats.plans ? apiStats.plans : [
     {label:'今日会话',count:0,cap:20,reset:'—',sub:'每日'},
     {label:'本周会话',count:0,cap:80,reset:'—',sub:'每周'},
-    {label:'本月会话',count:0,cap:300,reset:'—',sub:'每月'},
-    {label:'累计会话',count:0,cap:500,reset:'—',sub:'全部历史'},
-  ]).map(p => ({...p, pct: Math.round(Math.min(100, (p.count / Math.max(p.cap, 1)) * 100))}));
+    {label:'本月活跃',count:0,cap:300,reset:'—',sub:'每月'},
+    {label:'历史会话',count:0,cap:500,reset:'—',sub:'全部历史'},
+  ]).map(p => ({...p, label: planLabel(p.label), pct: Math.round(Math.min(100, (p.count / Math.max(p.cap, 1)) * 100))}));
 
   const colorFor = (v) => {
     if (v === 0) return 'var(--hm-0)';
@@ -106,7 +112,7 @@ const UsagePanel = () => {
         <div className="heatmap-col">
           <div className="heatmap-toolbar">
             <div className="seg heatmap-seg">
-              {[{id:'all',l:'全部'},{id:'30d',l:'30 天'},{id:'7d',l:'7 天'}].map(r => (
+              {[{id:'all',l:'全部'},{id:'30d',l:'30天'},{id:'7d',l:'7天'}].map(r => (
                 <button key={r.id} className={range === r.id ? 'active' : ''} onClick={() => setRange(r.id)}>{r.l}</button>
               ))}
             </div>

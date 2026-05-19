@@ -13,12 +13,68 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from flask import Flask, Response, abort, jsonify, request, send_file, send_from_directory
+# Flask is imported lazily inside _init_flask() so the splash window can show
+# before paying its ~200ms import cost. Names below are filled in then.
+Flask = None  # type: ignore
+Response = None  # type: ignore
+abort = None  # type: ignore
+jsonify = None  # type: ignore
+request = None  # type: ignore
+send_file = None  # type: ignore
+send_from_directory = None  # type: ignore
+
+_PROXY_URL = "http://127.0.0.1:18001"
+for _v in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+    os.environ.setdefault(_v, _PROXY_URL)
 
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
+NEW_CHAT_EXE_NAME = "Claude.exe"
+INDEX_FILE = Path.home() / ".claude_manager" / "index.json"
+INDEX_VERSION = 1
 HOST = "127.0.0.1"
 PORT = 8765
+CLAUDE_RESUME_PERMISSION_ARGS = [
+    "--permission-mode",
+    "bypassPermissions",
+    "--dangerously-skip-permissions",
+]
 ACTIVE_WINDOW_SECS = 180  # file mtime within this window → session is "active"
+
+_INDEX_LOCK = threading.Lock()
+_INDEX_CACHE: dict | None = None
+_NEW_CHAT_LOCK = threading.Lock()
+_NEW_CHAT_LAST_TS = 0.0
+_STATS_LOCK = threading.Lock()
+_STATS_CACHE: dict | None = None
+_STATS_CACHE_TS = 0.0
+_STATS_CACHE_TTL = 20.0
+
+
+def _load_index() -> dict:
+    global _INDEX_CACHE
+    if _INDEX_CACHE is not None:
+        return _INDEX_CACHE
+    try:
+        with open(INDEX_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and data.get("version") == INDEX_VERSION:
+            _INDEX_CACHE = data
+            return data
+    except (OSError, json.JSONDecodeError):
+        pass
+    _INDEX_CACHE = {"version": INDEX_VERSION, "entries": {}}
+    return _INDEX_CACHE
+
+
+def _save_index(data: dict) -> None:
+    try:
+        INDEX_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = INDEX_FILE.with_suffix(".json.tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
+        tmp.replace(INDEX_FILE)
+    except OSError:
+        pass
 
 
 def _resource_dir() -> Path:
@@ -29,9 +85,28 @@ def _resource_dir() -> Path:
     return Path(__file__).resolve().parent / "web"
 
 
+def _app_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def _new_chat_exe() -> Path:
+    return _app_dir() / NEW_CHAT_EXE_NAME
+
+
 WEB_DIR = _resource_dir()
 
-app = Flask(__name__, static_folder=None)
+# Routes are captured into _ROUTES by the `_route` decorator at import time,
+# then bound to the real Flask app inside _init_flask().
+_ROUTES: list[tuple[str, dict, Any]] = []
+
+
+def _route(rule: str, **options: Any):
+    def deco(fn):
+        _ROUTES.append((rule, options, fn))
+        return fn
+    return deco
 
 
 def _safe_project(name: str) -> Path:
@@ -117,7 +192,12 @@ def _extract_text(content: Any) -> str:
     return ""
 
 
-def _summarize_session(project: str, path: Path) -> dict:
+def _scan_session(project: str, path: Path) -> tuple[dict, list]:
+    """Walk JSONL once; return (summary_dict, cost_rows).
+
+    cost_rows is a list of [model, date_yyyy_mm_dd, in_t, out_t, cw_t, cr_t]
+    for every assistant message that reports `usage`. Used by /api/costs.
+    """
     sid = path.stem
     first_user_text = ""
     cwd = ""
@@ -127,6 +207,8 @@ def _summarize_session(project: str, path: Path) -> dict:
     user_count = 0
     assistant_count = 0
     summary = ""
+    cost_rows: list = []
+    seen_msg_ids: set[str] = set()  # de-dup by message.id (claude retries write twice)
 
     for obj in _iter_jsonl(path):
         t = obj.get("type")
@@ -151,6 +233,22 @@ def _summarize_session(project: str, path: Path) -> dict:
                 user_count += 1
         elif t == "assistant":
             assistant_count += 1
+            msg = obj.get("message") or {}
+            usage = msg.get("usage") or {}
+            in_t = int(usage.get("input_tokens") or 0)
+            out_t = int(usage.get("output_tokens") or 0)
+            cw_t = int(usage.get("cache_creation_input_tokens") or 0)
+            cr_t = int(usage.get("cache_read_input_tokens") or 0)
+            if in_t or out_t or cw_t or cr_t:
+                msg_id = msg.get("id") or ""
+                if msg_id and msg_id in seen_msg_ids:
+                    pass  # skip duplicate usage row
+                else:
+                    if msg_id:
+                        seen_msg_ids.add(msg_id)
+                    model = msg.get("model") or obj.get("model") or ""
+                    date = ts[:10] if ts else ""
+                    cost_rows.append([model, date, in_t, out_t, cw_t, cr_t])
         if ts:
             if not first_ts:
                 first_ts = ts
@@ -163,7 +261,7 @@ def _summarize_session(project: str, path: Path) -> dict:
         size, mtime = 0, 0
 
     active = (time.time() - mtime) < ACTIVE_WINDOW_SECS if mtime else False
-    return {
+    summary_dict = {
         "project": project,
         "sid": sid,
         "cwd": cwd,
@@ -178,36 +276,212 @@ def _summarize_session(project: str, path: Path) -> dict:
         "preview": first_user_text,
         "active": active,
     }
+    return summary_dict, cost_rows
 
 
-@app.route("/api/sessions")
+def _summarize_session(project: str, path: Path) -> dict:
+    return _scan_session(project, path)[0]
+
+
+# Pricing per million tokens (USD). Matches Anthropic public API rates as of
+# Apr 2026. Match by substring; first hit wins. Tweak if rates change.
+_MODEL_PRICES: list[tuple[str, tuple[float, float, float, float]]] = [
+    # (substring, (input, output, cache_write, cache_read))
+    ("opus",   (15.0, 75.0, 18.75, 1.5)),
+    ("sonnet", (3.0, 15.0, 3.75, 0.3)),
+    ("haiku",  (1.0, 5.0, 1.25, 0.1)),
+]
+
+
+def _model_price(model: str) -> tuple[float, float, float, float]:
+    m = (model or "").lower()
+    for key, p in _MODEL_PRICES:
+        if key in m:
+            return p
+    return (3.0, 15.0, 3.75, 0.3)  # default to sonnet rates
+
+
+@_route("/api/sessions")
 def api_sessions():
     if not PROJECTS_DIR.exists():
         return jsonify({"projects": [], "sessions": []})
+
     sessions = []
     projects = []
-    for proj_dir in sorted(PROJECTS_DIR.iterdir()):
-        if not proj_dir.is_dir():
-            continue
-        proj_sessions = []
-        for f in proj_dir.glob("*.jsonl"):
-            try:
-                proj_sessions.append(_summarize_session(proj_dir.name, f))
-            except Exception as e:
-                proj_sessions.append({
-                    "project": proj_dir.name, "sid": f.stem, "error": str(e),
-                    "mtime": f.stat().st_mtime, "size": f.stat().st_size,
-                    "summary": "", "preview": "", "cwd": "", "firstTs": "", "lastTs": "",
-                    "userCount": 0, "assistantCount": 0,
-                })
-        proj_sessions.sort(key=lambda s: s.get("mtime", 0), reverse=True)
-        projects.append({"name": proj_dir.name, "count": len(proj_sessions)})
-        sessions.extend(proj_sessions)
+    with _INDEX_LOCK:
+        index = _load_index()
+        entries = index["entries"]
+        seen_keys = set()
+        dirty = False
+        now = time.time()
+
+        for proj_dir in sorted(PROJECTS_DIR.iterdir()):
+            if not proj_dir.is_dir():
+                continue
+            proj_sessions = []
+            for f in proj_dir.glob("*.jsonl"):
+                key = f"{proj_dir.name}/{f.stem}"
+                seen_keys.add(key)
+                try:
+                    st = f.stat()
+                except OSError:
+                    continue
+                cached = entries.get(key)
+                if (cached
+                        and cached.get("mtime") == st.st_mtime
+                        and cached.get("size") == st.st_size
+                        and isinstance(cached.get("data"), dict)):
+                    summary = dict(cached["data"])
+                else:
+                    try:
+                        summary, costs = _scan_session(proj_dir.name, f)
+                        entries[key] = {
+                            "mtime": st.st_mtime,
+                            "size": st.st_size,
+                            "data": summary,
+                            "costs": costs,
+                        }
+                        dirty = True
+                    except Exception as e:
+                        summary = {
+                            "project": proj_dir.name, "sid": f.stem, "error": str(e),
+                            "mtime": st.st_mtime, "size": st.st_size,
+                            "summary": "", "preview": "", "cwd": "", "firstTs": "", "lastTs": "",
+                            "userCount": 0, "assistantCount": 0,
+                        }
+                # `active` depends on wall clock; always recompute.
+                summary["active"] = (now - st.st_mtime) < ACTIVE_WINDOW_SECS if st.st_mtime else False
+                proj_sessions.append(summary)
+            proj_sessions.sort(key=lambda s: s.get("mtime", 0), reverse=True)
+            projects.append({"name": proj_dir.name, "count": len(proj_sessions)})
+            sessions.extend(proj_sessions)
+
+        # Drop entries for files that no longer exist
+        stale = [k for k in entries if k not in seen_keys]
+        if stale:
+            for k in stale:
+                del entries[k]
+            dirty = True
+
+        if dirty:
+            _save_index(index)
+
     sessions.sort(key=lambda s: s.get("mtime", 0), reverse=True)
     return jsonify({"projects": projects, "sessions": sessions})
 
 
-@app.route("/api/session/<project>/<sid>")
+@_route("/api/costs")
+def api_costs():
+    """Aggregate token usage from JSONL → USD cost (priced at API rates).
+
+    Reads from the same on-disk index cache as /api/sessions; any file with
+    no cached `costs` field gets re-scanned and the cache updated.
+    """
+    if not PROJECTS_DIR.exists():
+        return jsonify({
+            "total": 0.0, "tokens": {"input":0,"output":0,"cacheWrite":0,"cacheRead":0},
+            "byModel": {}, "byDay": {}, "sessions": 0,
+        })
+
+    by_model: dict[str, dict] = {}
+    by_day: dict[str, float] = {}
+    by_day_tokens: dict[str, dict] = {}
+    total_cost = 0.0
+    total_in = total_out = total_cw = total_cr = 0
+    sessions_with_cost = 0
+
+    with _INDEX_LOCK:
+        index = _load_index()
+        entries = index["entries"]
+        seen_keys: set[str] = set()
+        dirty = False
+
+        for proj_dir in sorted(PROJECTS_DIR.iterdir()):
+            if not proj_dir.is_dir():
+                continue
+            for f in proj_dir.glob("*.jsonl"):
+                key = f"{proj_dir.name}/{f.stem}"
+                seen_keys.add(key)
+                try:
+                    st = f.stat()
+                except OSError:
+                    continue
+                cached = entries.get(key)
+                fresh = (
+                    cached
+                    and cached.get("mtime") == st.st_mtime
+                    and cached.get("size") == st.st_size
+                )
+                if fresh and isinstance(cached.get("costs"), list):
+                    rows = cached["costs"]
+                else:
+                    try:
+                        summary, rows = _scan_session(proj_dir.name, f)
+                    except Exception:
+                        continue
+                    entries[key] = {
+                        "mtime": st.st_mtime,
+                        "size": st.st_size,
+                        "data": (cached or {}).get("data") or summary,
+                        "costs": rows,
+                    }
+                    dirty = True
+
+                if rows:
+                    sessions_with_cost += 1
+                for row in rows:
+                    try:
+                        model, date, in_t, out_t, cw_t, cr_t = row
+                    except (ValueError, TypeError):
+                        continue
+                    p_in, p_out, p_cw, p_cr = _model_price(model)
+                    cost = (in_t * p_in + out_t * p_out + cw_t * p_cw + cr_t * p_cr) / 1_000_000.0
+                    total_cost += cost
+                    total_in += in_t
+                    total_out += out_t
+                    total_cw += cw_t
+                    total_cr += cr_t
+
+                    label = model or "unknown"
+                    bm = by_model.setdefault(label, {
+                        "input": 0, "output": 0, "cacheWrite": 0, "cacheRead": 0, "cost": 0.0,
+                    })
+                    bm["input"] += in_t
+                    bm["output"] += out_t
+                    bm["cacheWrite"] += cw_t
+                    bm["cacheRead"] += cr_t
+                    bm["cost"] += cost
+
+                    if date:
+                        by_day[date] = by_day.get(date, 0.0) + cost
+                        bd = by_day_tokens.setdefault(date, {
+                            "input": 0, "output": 0, "cacheWrite": 0, "cacheRead": 0,
+                        })
+                        bd["input"] += in_t
+                        bd["output"] += out_t
+                        bd["cacheWrite"] += cw_t
+                        bd["cacheRead"] += cr_t
+
+        if dirty:
+            _save_index(index)
+
+    # Sort byDay descending by date for the frontend
+    by_day_sorted = dict(sorted(by_day.items(), reverse=True))
+    return jsonify({
+        "total": round(total_cost, 4),
+        "tokens": {
+            "input": total_in, "output": total_out,
+            "cacheWrite": total_cw, "cacheRead": total_cr,
+        },
+        "byModel": by_model,
+        "byDay": by_day_sorted,
+        "byDayTokens": by_day_tokens,
+        "sessions": sessions_with_cost,
+        "prices": {k: v for k, v in _MODEL_PRICES},
+    })
+
+
+@_route("/api/session/<project>/<sid>")
 def api_session_detail(project: str, sid: str):
     f = _safe_session(project, sid)
     messages = []
@@ -251,51 +525,149 @@ def api_session_detail(project: str, sid: str):
     })
 
 
-@app.route("/api/search")
+# In-memory search index: project/sid → (mtime, size, lowercase_blob).
+# Built lazily on first search, reused for subsequent queries — string scan
+# instead of JSONL re-parse. Stale entries are detected via (mtime, size).
+@_route("/api/open-cwd", methods=["POST"])
+def api_open_cwd():
+    data = request.get_json(silent=True) or {}
+    project = data.get("project", "")
+    sid = data.get("sid", "")
+    f = _safe_session(project, sid)
+    cwd = ""
+    for obj in _iter_jsonl(f):
+        cwd = obj.get("cwd", "") or cwd
+        if cwd:
+            break
+    p = Path(cwd).expanduser() if cwd else None
+    if not p or not p.exists() or not p.is_dir():
+        return jsonify({"ok": False, "error": f"cwd not found: {cwd}"}), 404
+    try:
+        if sys.platform.startswith("win"):
+            os.startfile(str(p))  # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", str(p)])
+        else:
+            subprocess.Popen(["xdg-open", str(p)])
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+    return jsonify({"ok": True, "cwd": str(p)})
+
+
+_SEARCH_BLOBS: dict[str, tuple[float, int, str]] = {}
+
+
+def _build_search_blob(path: Path) -> str:
+    """Concat all user/assistant/summary text in lowercase. Used for substring search."""
+    parts: list[str] = []
+    for obj in _iter_jsonl(path):
+        t = obj.get("type")
+        if t == "summary":
+            s = obj.get("summary", "")
+            if s:
+                parts.append(s)
+            continue
+        if t not in ("user", "assistant"):
+            continue
+        msg = obj.get("message") or {}
+        text = _extract_text(msg.get("content"))
+        if text:
+            parts.append(text)
+    return "\n".join(parts).lower()
+
+
+def _ensure_blob(arg):
+    proj_name, f = arg
+    try:
+        st = f.stat()
+    except OSError:
+        return None
+    key = f"{proj_name}/{f.stem}"
+    cached = _SEARCH_BLOBS.get(key)
+    if cached and cached[0] == st.st_mtime and cached[1] == st.st_size:
+        blob = cached[2]
+    else:
+        try:
+            blob = _build_search_blob(f)
+        except Exception:
+            return None
+        _SEARCH_BLOBS[key] = (st.st_mtime, st.st_size, blob)
+    return (proj_name, f, st.st_mtime, blob)
+
+
+@_route("/api/search")
 def api_search():
     q = (request.args.get("q") or "").strip()
     if not q:
         return jsonify({"results": []})
     ql = q.lower()
-    results = []
     if not PROJECTS_DIR.exists():
         return jsonify({"results": []})
+
+    # Gather files
+    files: list[tuple[str, Path]] = []
     for proj_dir in sorted(PROJECTS_DIR.iterdir()):
         if not proj_dir.is_dir():
             continue
         for f in proj_dir.glob("*.jsonl"):
-            hits = []
-            for obj in _iter_jsonl(f):
-                t = obj.get("type")
-                if t not in ("user", "assistant", "summary"):
-                    continue
-                text = ""
-                if t == "summary":
-                    text = obj.get("summary", "")
-                else:
-                    msg = obj.get("message") or {}
-                    text = _extract_text(msg.get("content"))
-                if not text:
-                    continue
-                if ql in text.lower():
-                    i = text.lower().find(ql)
-                    s = max(0, i - 40)
-                    e = min(len(text), i + len(q) + 80)
-                    hits.append({"role": t, "snippet": text[s:e], "ts": obj.get("timestamp", "")})
-                    if len(hits) >= 3:
-                        break
-            if hits:
-                results.append({
-                    "project": proj_dir.name,
-                    "sid": f.stem,
-                    "mtime": f.stat().st_mtime,
-                    "hits": hits,
-                })
+            files.append((proj_dir.name, f))
+
+    # Cheap evict: drop blob entries for files that no longer exist.
+    seen_keys = {f"{p}/{f.stem}" for p, f in files}
+    for stale in [k for k in _SEARCH_BLOBS if k not in seen_keys]:
+        _SEARCH_BLOBS.pop(stale, None)
+
+    # Phase 1: ensure each file's blob is cached, in parallel for cold starts.
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        prepared = list(ex.map(_ensure_blob, files))
+
+    # Phase 2: filter candidates by substring on the cached blob.
+    candidates = []
+    for entry in prepared:
+        if not entry:
+            continue
+        proj_name, f, mtime, blob = entry
+        if ql in blob:
+            candidates.append((proj_name, f, mtime))
+
+    # Phase 3: only candidates re-parse JSONL to extract snippets.
+    results = []
+    for proj_name, f, mtime in candidates:
+        hits = []
+        for obj in _iter_jsonl(f):
+            t = obj.get("type")
+            if t not in ("user", "assistant", "summary"):
+                continue
+            text = ""
+            if t == "summary":
+                text = obj.get("summary", "")
+            else:
+                msg = obj.get("message") or {}
+                text = _extract_text(msg.get("content"))
+            if not text:
+                continue
+            tl = text.lower()
+            i = tl.find(ql)
+            if i >= 0:
+                s = max(0, i - 40)
+                e = min(len(text), i + len(q) + 80)
+                hits.append({"role": t, "snippet": text[s:e], "ts": obj.get("timestamp", "")})
+                if len(hits) >= 3:
+                    break
+        if hits:
+            results.append({
+                "project": proj_name,
+                "sid": f.stem,
+                "mtime": mtime,
+                "hits": hits,
+            })
+
     results.sort(key=lambda r: r.get("mtime", 0), reverse=True)
     return jsonify({"results": results})
 
 
-@app.route("/api/export/<project>/<sid>")
+@_route("/api/export/<project>/<sid>")
 def api_export(project: str, sid: str):
     fmt = request.args.get("format", "md").lower()
     f = _safe_session(project, sid)
@@ -336,7 +708,7 @@ def api_export(project: str, sid: str):
                      download_name=f"{sid}.md", mimetype="text/markdown")
 
 
-@app.route("/api/delete", methods=["POST"])
+@_route("/api/delete", methods=["POST"])
 def api_delete():
     data = request.get_json(silent=True) or {}
     project = data.get("project", "")
@@ -360,12 +732,72 @@ def api_delete():
 def _find_cli(name: str) -> str | None:
     """Locate a CLI binary without requiring shell resolution."""
     import shutil as _sh
-    # common Windows / PATH locations
-    for candidate in (name, f"{name}.cmd", f"{name}.exe"):
+
+    def same_path(a: Path, b: Path) -> bool:
+        try:
+            return os.path.normcase(str(a.resolve())) == os.path.normcase(str(b.resolve()))
+        except OSError:
+            return os.path.normcase(str(a)) == os.path.normcase(str(b))
+
+    def is_sidecar(path: Path) -> bool:
+        sidecars = (_new_chat_exe(), Path.cwd() / NEW_CHAT_EXE_NAME)
+        return any(same_path(path, sidecar) for sidecar in sidecars)
+
+    if sys.platform.startswith("win") and name.lower() == "claude":
+        native = Path.home() / ".local" / "bin" / "claude.exe"
+        if native.is_file() and not is_sidecar(native):
+            return str(native.resolve())
+
+    candidates = (f"{name}.exe", f"{name}.cmd", name) if sys.platform.startswith("win") else (name,)
+    for candidate in candidates:
+        for raw_dir in os.environ.get("PATH", "").split(os.pathsep):
+            if not raw_dir:
+                continue
+            p = Path(raw_dir).expanduser() / candidate
+            try:
+                if p.is_file() and not is_sidecar(p):
+                    return str(p.resolve())
+            except OSError:
+                continue
         p = _sh.which(candidate)
         if p:
-            return p
+            resolved = Path(p).resolve()
+            if not is_sidecar(resolved):
+                return str(resolved)
     return None
+
+
+def _shell_single_quote(s: str) -> str:
+    return "'" + s.replace("'", "''") + "'"
+
+
+def _windows_terminal_encoding_prelude() -> str:
+    return (
+        "$utf8NoBom = New-Object System.Text.UTF8Encoding -ArgumentList $false\n"
+        "[Console]::InputEncoding = $utf8NoBom\n"
+        "[Console]::OutputEncoding = $utf8NoBom\n"
+        "$OutputEncoding = $utf8NoBom\n"
+        "$env:PYTHONUTF8 = '1'\n"
+        "$env:PYTHONIOENCODING = 'utf-8'\n"
+        "try { chcp.com 65001 > $null } catch {}\n"
+    )
+
+
+def _spawn_terminal(cwd: str, command: str, title: str = "Claude Manager") -> None:
+    if sys.platform.startswith("win"):
+        import base64 as _b64
+        ps_script = (
+            _windows_terminal_encoding_prelude() +
+            f"Set-Location -LiteralPath {_shell_single_quote(cwd)}\n"
+            f"{command}\n"
+        )
+        encoded = _b64.b64encode(ps_script.encode("utf-16le")).decode("ascii")
+        subprocess.Popen(f'start "{title}" powershell -NoExit -EncodedCommand {encoded}', shell=True)
+    elif sys.platform == "darwin":
+        script = f'tell app "Terminal" to do script "cd {json.dumps(cwd)} && {command}"'
+        subprocess.Popen(["osascript", "-e", script])
+    else:
+        subprocess.Popen(["x-terminal-emulator", "-e", f"bash -c 'cd {cwd!r} && {command}; exec bash'"])
 
 
 def _run_cli(args: list[str], stdin_text: str = "", timeout: int = 90,
@@ -477,7 +909,7 @@ def _session_as_markdown(project: str, sid: str) -> tuple[str, str]:
     return cwd, "\n".join(lines)
 
 
-@app.route("/api/assistant", methods=["POST"])
+@_route("/api/assistant", methods=["POST"])
 def api_assistant():
     """Natural-language command → JSON intent via `claude -p`.
 
@@ -587,7 +1019,7 @@ def api_assistant():
     return jsonify({"ok": True, "action": action, "targets": resolved, "reply": reply})
 
 
-@app.route("/api/merge", methods=["POST"])
+@_route("/api/merge", methods=["POST"])
 def api_merge():
     """Summarise N sessions into a single meeting-minutes markdown via claude."""
     data = request.get_json(silent=True) or {}
@@ -650,7 +1082,7 @@ def api_merge():
     })
 
 
-@app.route("/api/codex", methods=["POST"])
+@_route("/api/codex", methods=["POST"])
 def api_codex():
     """Export session as MD into its cwd and launch codex in that cwd."""
     data = request.get_json(silent=True) or {}
@@ -661,7 +1093,7 @@ def api_codex():
         return jsonify({"ok": False, "error": f"cwd not found: {cwd}"}), 400
     md_path = Path(cwd) / f"_claude_manager_{sid}.md"
     try:
-        md_path.write_text(md, encoding="utf-8")
+        md_path.write_text(md, encoding="utf-8-sig")
     except OSError as e:
         return jsonify({"ok": False, "error": f"write failed: {e}"}), 500
 
@@ -676,108 +1108,20 @@ def api_codex():
     )
     try:
         if sys.platform.startswith("win"):
-            # Escape the cwd path + embed a short initial prompt referencing the md file.
-            safe_prompt = prompt.replace('"', '\\"')
-            cmd = f'start "" cmd /k "cd /d \"{cwd}\" && codex \"{safe_prompt}\""'
-            subprocess.Popen(cmd, shell=True)
+            cmd = f"& {_shell_single_quote(codex_path)} {_shell_single_quote(prompt)}"
+            _spawn_terminal(cwd, cmd, "Codex")
         elif sys.platform == "darwin":
-            script = f'tell app "Terminal" to do script "cd {json.dumps(cwd)} && codex {json.dumps(prompt)}"'
+            script = f'tell app "Terminal" to do script "cd {json.dumps(cwd)} && {json.dumps(codex_path)} {json.dumps(prompt)}"'
             subprocess.Popen(["osascript", "-e", script])
         else:
             subprocess.Popen(["x-terminal-emulator", "-e",
-                              f"bash -c 'cd {cwd!r} && codex {json.dumps(prompt)}; exec bash'"])
+                              f"bash -c 'cd {cwd!r} && {codex_path!r} {json.dumps(prompt)}; exec bash'"])
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
     return jsonify({"ok": True, "cwd": cwd, "mdPath": str(md_path)})
 
 
-@app.route("/api/new-chat", methods=["POST"])
-def api_new_chat():
-    """Open a fresh `claude` session. Prefers the original conversation's cwd
-    if it still exists, otherwise falls back to the user's home directory —
-    either way we just pop a terminal and run `claude`, no --resume, no
-    initial prompt (both still trigger Anthropic's 403 policy wall)."""
-    data = request.get_json(silent=True) or {}
-    project = data.get("project", "")
-    sid = data.get("sid", "")
-    f = _safe_session(project, sid)
-    cwd = ""
-    for obj in _iter_jsonl(f):
-        if obj.get("cwd"):
-            cwd = obj["cwd"]
-            break
-    # If the session's cwd was deleted, recreate it so the new shell lands
-    # exactly where the old conversation lived. Only fall back to home when
-    # the session never recorded a cwd at all.
-    if not cwd:
-        cwd = str(Path.home())
-    else:
-        try:
-            Path(cwd).mkdir(parents=True, exist_ok=True)
-        except OSError:
-            cwd = str(Path.home())
-    resume_cmd = f"claude --resume {sid}"
-    try:
-        if sys.platform.startswith("win"):
-            # Build a small PowerShell bootstrap that:
-            #   1. cd's into the session's cwd
-            #   2. overrides `prompt` so that the first time the REPL is
-            #      about to ask for input, PSReadLine pre-fills the buffer
-            #      with `claude --resume <sid>` — user just hits Enter
-            #   3. restores `prompt` + falls back to Set-Clipboard if
-            #      PSReadLine is unavailable
-            # Passed via -EncodedCommand to avoid quoting hell.
-            import base64 as _b64
-            ps_cwd = "'" + cwd.replace("'", "''") + "'"
-            ps_cmd = "'" + resume_cmd.replace("'", "''") + "'"
-            ps_script = (
-                f"Set-Location -LiteralPath {ps_cwd}\n"
-                f"$global:__cm_preload = {ps_cmd}\n"
-                "$global:__cm_origPrompt = $function:prompt\n"
-                "function prompt {\n"
-                "    $text = & $global:__cm_origPrompt\n"
-                "    if ($global:__cm_preload) {\n"
-                "        try { [Microsoft.PowerShell.PSConsoleReadLine]::Insert($global:__cm_preload) }\n"
-                "        catch { Set-Clipboard -Value $global:__cm_preload }\n"
-                "        $global:__cm_preload = $null\n"
-                "        $function:prompt = $global:__cm_origPrompt\n"
-                "    }\n"
-                "    $text\n"
-                "}\n"
-            )
-            encoded = _b64.b64encode(ps_script.encode("utf-16le")).decode("ascii")
-            cmd = f'start "" powershell -NoExit -EncodedCommand {encoded}'
-            subprocess.Popen(cmd, shell=True)
-        elif sys.platform == "darwin":
-            # Terminal.app has no equivalent of PSReadLine::Insert, so we
-            # send the command as a keystroke after `cd`. User hits Enter
-            # to run; if they don't want it, they Cmd+K the buffer.
-            # `do script` returns before the shell is interactive, so
-            # include a tiny delay inside the script chain.
-            esc_cwd = cwd.replace("\\", "\\\\").replace('"', '\\"')
-            esc_cmd = resume_cmd.replace("\\", "\\\\").replace('"', '\\"')
-            script = (
-                f'tell application "Terminal"\n'
-                f'  activate\n'
-                f'  do script "cd \\"{esc_cwd}\\"; printf \'%s\' \'{esc_cmd}\'"\n'
-                f'end tell'
-            )
-            subprocess.Popen(["osascript", "-e", script])
-        else:
-            # bash: use readline bind to stuff the buffer. Works with
-            # default readline config; falls back cleanly if not.
-            bashrc_line = (
-                f"cd {cwd!r}; "
-                f"bind '\"\\e[0n\": \"{resume_cmd}\"' 2>/dev/null; "
-                f"printf '\\e[5n'; exec bash"
-            )
-            subprocess.Popen(["x-terminal-emulator", "-e", f"bash -c {bashrc_line!r}"])
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-    return jsonify({"ok": True, "cwd": cwd})
-
-
-@app.route("/api/resume", methods=["POST"])
+@_route("/api/resume", methods=["POST"])
 def api_resume():
     data = request.get_json(silent=True) or {}
     project = data.get("project", "")
@@ -791,26 +1135,35 @@ def api_resume():
     if not cwd or not Path(cwd).exists():
         return jsonify({"ok": False, "error": f"cwd not found: {cwd}"}), 400
     # No pre-flight auth gate here: token validity doesn't predict whether
-    # Anthropic's policy engine will accept the compaction call, and spawning
-    # a terminal that just runs `claude --resume <sid>` is exactly what the
+    # Anthropic's policy engine will accept the resumed terminal. Resume passes
+    # both supported bypass flags so it does not prompt for yes/no.
     # user would type manually — we shouldn't second-guess it.
-    cmdline = f"claude --resume {sid}"
+    claude_path = _find_cli("claude")
+    if not claude_path:
+        return jsonify({"ok": False, "error": "claude CLI not found"}), 500
+    resume_args = [*CLAUDE_RESUME_PERMISSION_ARGS, "--resume", sid]
+    resume_args_ps = " ".join(_shell_single_quote(x) for x in resume_args)
+    cmdline = "claude " + resume_args_ps
     try:
         if sys.platform.startswith("win"):
-            cmd = f'start "" cmd /k "cd /d \"{cwd}\" && {cmdline}"'
-            subprocess.Popen(cmd, shell=True)
+            cmd = (
+                f'$env:HTTP_PROXY = "{_PROXY_URL}"\n'
+                f'$env:HTTPS_PROXY = "{_PROXY_URL}"\n'
+                f"& {_shell_single_quote(claude_path)} {resume_args_ps}"
+            )
+            _spawn_terminal(cwd, cmd, "Claude Resume")
         elif sys.platform == "darwin":
-            script = f'tell app "Terminal" to do script "cd {json.dumps(cwd)} && {cmdline}"'
+            script = f'tell app "Terminal" to do script "cd {json.dumps(cwd)} && {json.dumps(claude_path)} --permission-mode bypassPermissions --dangerously-skip-permissions --resume {json.dumps(sid)}"'
             subprocess.Popen(["osascript", "-e", script])
         else:
             subprocess.Popen(["x-terminal-emulator", "-e",
-                              f"bash -c 'cd {cwd!r} && {cmdline}; exec bash'"])
+                              f"bash -c 'cd {cwd!r} && {claude_path!r} --permission-mode bypassPermissions --dangerously-skip-permissions --resume {sid!r}; exec bash'"])
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
     return jsonify({"ok": True, "cwd": cwd, "command": cmdline})
 
 
-@app.route("/api/active")
+@_route("/api/active")
 def api_active():
     """Lightweight: return just the ids of sessions with recent mtime."""
     if not PROJECTS_DIR.exists():
@@ -828,6 +1181,36 @@ def api_active():
             if (now - mtime) < ACTIVE_WINDOW_SECS:
                 active.append({"project": proj_dir.name, "sid": f.stem, "mtime": mtime})
     return jsonify({"active": active, "windowSecs": ACTIVE_WINDOW_SECS})
+
+
+@_route("/api/notify", methods=["POST"])
+def api_notify():
+    """Show a Windows toast notification. Falls back silently if PowerShell/WinRT unavailable."""
+    if sys.platform != "win32":
+        return jsonify({"ok": False, "error": "only-win32"}), 400
+    payload = request.get_json(silent=True) or {}
+    title = (payload.get("title") or "Claude Manager").replace("'", "''")[:120]
+    body  = (payload.get("body")  or "").replace("'", "''")[:240]
+    ps = (
+        "[Windows.UI.Notifications.ToastNotificationManager,Windows.UI.Notifications,ContentType=WindowsRuntime] | Out-Null;"
+        "[Windows.Data.Xml.Dom.XmlDocument,Windows.Data.Xml.Dom.XmlDocument,ContentType=WindowsRuntime] | Out-Null;"
+        "$tpl=[Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent("
+        "[Windows.UI.Notifications.ToastTemplateType]::ToastText02);"
+        f"$nodes=$tpl.GetElementsByTagName('text');"
+        f"$nodes.Item(0).AppendChild($tpl.CreateTextNode('{title}')) | Out-Null;"
+        f"$nodes.Item(1).AppendChild($tpl.CreateTextNode('{body}')) | Out-Null;"
+        "$toast=[Windows.UI.Notifications.ToastNotification]::new($tpl);"
+        "[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('Claude Manager').Show($toast);"
+    )
+    try:
+        flags = 0x08000000  # CREATE_NO_WINDOW
+        subprocess.Popen(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+            creationflags=flags, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+    return jsonify({"ok": True})
 
 
 def _read_oauth() -> dict:
@@ -875,12 +1258,43 @@ def _needs_login_response(reason: str):
     }), 401
 
 
-@app.route("/api/auth-status")
+@_route("/api/auth-status")
 def api_auth_status():
     return jsonify(_auth_status())
 
 
-@app.route("/api/claude-login", methods=["POST"])
+@_route("/api/new-chat", methods=["POST"])
+def api_new_chat():
+    """Launch the sidecar Claude.exe placed next to ClaudeManager.exe."""
+    global _NEW_CHAT_LAST_TS
+    exe = _new_chat_exe()
+    if not exe.exists():
+        return jsonify({"ok": False, "error": f"not found: {exe}"}), 404
+    with _NEW_CHAT_LOCK:
+        now = time.monotonic()
+        if now - _NEW_CHAT_LAST_TS < 2.0:
+            return jsonify({"ok": False, "error": "please wait before launching another chat"}), 429
+        _NEW_CHAT_LAST_TS = now
+    try:
+        env = os.environ.copy()
+        env.setdefault("HTTP_PROXY", _PROXY_URL)
+        env.setdefault("HTTPS_PROXY", _PROXY_URL)
+        proc = subprocess.Popen(
+            [str(exe)],
+            cwd=str(exe.parent),
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+        )
+    except Exception as e:
+        with _NEW_CHAT_LOCK:
+            _NEW_CHAT_LAST_TS = 0.0
+        return jsonify({"ok": False, "error": str(e)}), 500
+    return jsonify({"ok": True, "pid": proc.pid, "path": str(exe)})
+
+
+@_route("/api/claude-login", methods=["POST"])
 def api_claude_login():
     """Spawn a visible terminal running `claude /login` so the user can
     complete the OAuth flow. Non-blocking."""
@@ -889,8 +1303,14 @@ def api_claude_login():
         return jsonify({"ok": False, "error": "claude CLI not found"}), 500
     try:
         if sys.platform.startswith("win"):
-            # /k keeps the window open after /login returns so user sees the result.
-            cmd = f'start "Claude Login" cmd /k "\"{claude}\" /login"'
+            import base64 as _b64
+            ps_script = (
+                f'$env:HTTP_PROXY = "{_PROXY_URL}"\n'
+                f'$env:HTTPS_PROXY = "{_PROXY_URL}"\n'
+                f"& '{claude}' /login\n"
+            )
+            encoded = _b64.b64encode(ps_script.encode("utf-16le")).decode("ascii")
+            cmd = f'start "Claude Login" powershell -NoExit -EncodedCommand {encoded}'
             subprocess.Popen(cmd, shell=True)
         elif sys.platform == "darwin":
             script = f'tell app "Terminal" to do script {json.dumps(f"{claude} /login")}'
@@ -903,7 +1323,7 @@ def api_claude_login():
     return jsonify({"ok": True})
 
 
-@app.route("/api/account")
+@_route("/api/account")
 def api_account():
     """Return whatever Claude plan info we can glean from ~/.claude/.credentials.json."""
     cred_path = Path.home() / ".claude" / ".credentials.json"
@@ -942,11 +1362,38 @@ def api_account():
     })
 
 
-@app.route("/api/stats")
+@_route("/api/stats")
 def api_stats():
-    """Aggregate session activity for the usage panel (heatmap + stats)."""
+    """Return cached session activity for the usage panel."""
+    global _STATS_CACHE, _STATS_CACHE_TS
+
+    now_mono = time.monotonic()
+    if _STATS_CACHE is not None and now_mono - _STATS_CACHE_TS < _STATS_CACHE_TTL:
+        return jsonify(_STATS_CACHE)
+
+    lock_acquired = _STATS_LOCK.acquire(blocking=False)
+    if not lock_acquired:
+        if _STATS_CACHE is not None:
+            return jsonify(_STATS_CACHE)
+        _STATS_LOCK.acquire()
+        lock_acquired = True
+
+    try:
+        if _STATS_CACHE is not None and time.monotonic() - _STATS_CACHE_TS < _STATS_CACHE_TTL:
+            return jsonify(_STATS_CACHE)
+        payload = _build_stats_payload()
+        _STATS_CACHE = payload
+        _STATS_CACHE_TS = time.monotonic()
+        return jsonify(payload)
+    finally:
+        if lock_acquired:
+            _STATS_LOCK.release()
+
+
+def _build_stats_payload():
+    """Aggregate session activity without HTTP/cache concerns."""
     if not PROJECTS_DIR.exists():
-        return jsonify({"heatmap": [], "totals": {}})
+        return {"heatmap": [], "totals": {}}
     from collections import Counter
     day_count = Counter()            # date -> session count
     model_count = Counter()
@@ -955,6 +1402,21 @@ def api_stats():
     longest = 0
     most_msgs_day = ("", 0)
     streak_set = set()
+
+    def _local_datetime(ts: str) -> datetime | None:
+        if not ts:
+            return None
+        try:
+            dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone()
+        except Exception:
+            return None
+
+    def _local_date(ts: str) -> str:
+        dt = _local_datetime(ts)
+        return dt.date().isoformat() if dt else ""
 
     for proj_dir in PROJECTS_DIR.iterdir():
         if not proj_dir.is_dir():
@@ -983,12 +1445,17 @@ def api_stats():
                     if not first_ts:
                         first_ts = ts
                     last_ts = ts
-            if first_ts:
-                day = first_ts[:10]
-                day_count[day] += 1
-                streak_set.add(day)
+            activity_day = _local_date(last_ts)
+            if not activity_day:
+                try:
+                    activity_day = datetime.fromtimestamp(f.stat().st_mtime).astimezone().date().isoformat()
+                except OSError:
+                    activity_day = _local_date(first_ts)
+            if activity_day:
+                day_count[activity_day] += 1
+                streak_set.add(activity_day)
                 if msg_count > most_msgs_day[1]:
-                    most_msgs_day = (day, msg_count)
+                    most_msgs_day = (activity_day, msg_count)
             if first_ts and last_ts:
                 try:
                     d = (datetime.fromisoformat(last_ts.replace("Z", "+00:00"))
@@ -998,7 +1465,8 @@ def api_stats():
                 except Exception:
                     pass
 
-    today = datetime.utcnow().date()
+    now = datetime.now().astimezone()
+    today = now.date()
     streak = 0
     cur = today
     while cur.isoformat() in streak_set:
@@ -1033,15 +1501,14 @@ def api_stats():
             return f"{h}h {m}m 后重置"
         return f"{m} 分钟后重置"
 
-    now = datetime.utcnow()
-    next_midnight = datetime.combine(today.fromordinal(today.toordinal() + 1), datetime.min.time())
+    next_midnight = datetime.combine(today.fromordinal(today.toordinal() + 1), datetime.min.time(), tzinfo=now.tzinfo)
     days_to_sunday = (6 - today.weekday()) % 7 or 7
-    next_sunday = datetime.combine(today.fromordinal(today.toordinal() + days_to_sunday), datetime.min.time())
+    next_sunday = datetime.combine(today.fromordinal(today.toordinal() + days_to_sunday), datetime.min.time(), tzinfo=now.tzinfo)
     if today.month == 12:
         first_next = today.replace(year=today.year + 1, month=1, day=1)
     else:
         first_next = today.replace(month=today.month + 1, day=1)
-    next_month = datetime.combine(first_next, datetime.min.time())
+    next_month = datetime.combine(first_next, datetime.min.time(), tzinfo=now.tzinfo)
 
     # heatmap: 53 weeks x 7 days ending today
     import math
@@ -1095,10 +1562,10 @@ def api_stats():
     plans = [
         {"label": "今日会话", "count": day_sessions, "cap": 20, "reset": _fmt_delta(int((next_midnight - now).total_seconds())), "sub": "每日"},
         {"label": "本周会话", "count": week_sessions, "cap": 80, "reset": _fmt_delta(int((next_sunday - now).total_seconds())), "sub": "每周"},
-        {"label": "本月会话", "count": month_sessions, "cap": 300, "reset": _fmt_delta(int((next_month - now).total_seconds())), "sub": "每月"},
-        {"label": "累计会话", "count": total_sessions, "cap": max(total_sessions, 500), "reset": "不重置", "sub": "全部历史"},
+        {"label": "本月活跃", "count": month_sessions, "cap": 300, "reset": _fmt_delta(int((next_month - now).total_seconds())), "sub": "每月"},
+        {"label": "历史会话", "count": total_sessions, "cap": max(total_sessions, 500), "reset": "不重置", "sub": "全部历史"},
     ]
-    return jsonify({"heatmap": grid, "totals": totals, "plans": plans, "recentDays": recent_days})
+    return {"heatmap": grid, "totals": totals, "plans": plans, "recentDays": recent_days}
 
 
 def _no_cache(resp):
@@ -1106,12 +1573,12 @@ def _no_cache(resp):
     return resp
 
 
-@app.route("/")
+@_route("/")
 def index():
     return _no_cache(send_from_directory(str(WEB_DIR), "index.html"))
 
 
-@app.route("/<path:filename>")
+@_route("/<path:filename>")
 def static_file(filename: str):
     if ".." in filename or filename.startswith("/"):
         abort(404)
@@ -1123,7 +1590,27 @@ def static_file(filename: str):
     return _no_cache(send_from_directory(str(WEB_DIR), filename))
 
 
+def _init_flask():
+    """Import Flask and bind captured routes. Called once from _run_flask."""
+    global Flask, Response, abort, jsonify, request, send_file, send_from_directory
+    from flask import Flask as _Flask, Response as _Response, abort as _abort
+    from flask import jsonify as _jsonify, request as _request
+    from flask import send_file as _send_file, send_from_directory as _send_from_directory
+    Flask = _Flask
+    Response = _Response
+    abort = _abort
+    jsonify = _jsonify
+    request = _request
+    send_file = _send_file
+    send_from_directory = _send_from_directory
+    app = Flask(__name__, static_folder=None)
+    for rule, options, fn in _ROUTES:
+        app.add_url_rule(rule, endpoint=fn.__name__, view_func=fn, **options)
+    return app
+
+
 def _run_flask():
+    app = _init_flask()
     from werkzeug.serving import make_server
     srv = make_server(HOST, PORT, app, threaded=True)
     srv.serve_forever()
@@ -1141,16 +1628,34 @@ def _wait_for_server(timeout: float = 5.0) -> bool:
     return False
 
 
+_SPLASH_HTML = """<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"/><title>Claude Manager</title>
+<style>
+html,body{margin:0;height:100%}
+body{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:18px;
+  background:#fafaf7;color:#6b6b66;
+  font:13px/1.4 -apple-system,BlinkMacSystemFont,'Segoe UI',Inter,system-ui,sans-serif;letter-spacing:.02em}
+.r{width:28px;height:28px;border-radius:50%;border:2px solid rgba(0,0,0,.08);border-top-color:#1f1f1c;
+  animation:s .9s linear infinite}
+@keyframes s{to{transform:rotate(360deg)}}
+@media (prefers-color-scheme:dark){body{background:#1a1a18;color:#9a9a92}.r{border-color:rgba(255,255,255,.12);border-top-color:#e8e8e2}}
+</style></head><body><div class="r"></div><div>Claude Manager · 加载中…</div></body></html>"""
+
+
 def main():
     print("Claude Manager")
     print(f"Projects dir: {PROJECTS_DIR}")
     print(f"Serving on http://{HOST}:{PORT}")
-    purged = _purge_assistant_leftovers()
-    if purged:
-        print(f"Purged {purged} assistant-leftover session file(s)")
 
+    # Start Flask immediately so we can show the window before it's ready.
     threading.Thread(target=_run_flask, daemon=True).start()
-    _wait_for_server()
+
+    # Run the leftover purge off the critical path.
+    def _bg_purge():
+        purged = _purge_assistant_leftovers()
+        if purged:
+            print(f"Purged {purged} assistant-leftover session file(s)")
+    threading.Thread(target=_bg_purge, daemon=True).start()
 
     # Prefer a native window via pywebview. Fall back to the default browser
     # if pywebview or its backend (e.g. WebView2 runtime) is unavailable.
@@ -1158,18 +1663,28 @@ def main():
     if not use_browser:
         try:
             import webview  # type: ignore
-            webview.create_window(
+            window = webview.create_window(
                 "Claude Manager",
-                f"http://{HOST}:{PORT}",
+                html=_SPLASH_HTML,
                 width=1280, height=840,
                 min_size=(960, 640),
                 text_select=True,
             )
+
+            def _switch_to_app():
+                if _wait_for_server():
+                    try:
+                        window.load_url(f"http://{HOST}:{PORT}")
+                    except Exception as e:
+                        print(f"load_url failed: {e}")
+
+            threading.Thread(target=_switch_to_app, daemon=True).start()
             webview.start()
             return
         except Exception as e:
             print(f"pywebview unavailable ({e}); falling back to browser…")
 
+    _wait_for_server()
     threading.Thread(
         target=lambda: (time.sleep(0.3), webbrowser.open(f"http://{HOST}:{PORT}")),
         daemon=True,

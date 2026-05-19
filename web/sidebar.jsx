@@ -11,6 +11,22 @@ const Sidebar = ({ view, setView, selectedProject, setSelectedProject, selectedT
     return () => clearInterval(h);
   }, []);
   const authBad = account && account.auth && !account.auth.ok;
+  const [newChatBusy, setNewChatBusy] = React.useState(false);
+  const onNewChat = React.useCallback(async () => {
+    if (newChatBusy) return;
+    setNewChatBusy(true);
+    try {
+      const r = await fetch('/api/new-chat', {method:'POST'});
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok || !d.ok) {
+        await window.dialog.alert('启动失败: ' + (d.error || `HTTP ${r.status}`), {title:'新建对话失败', danger:true});
+      }
+    } catch (e) {
+      await window.dialog.alert('启动失败: ' + e, {title:'新建对话失败', danger:true});
+    } finally {
+      setTimeout(() => setNewChatBusy(false), 1500);
+    }
+  }, [newChatBusy]);
   const onRelogin = async () => {
     try {
       const r = await fetch('/api/claude-login', {method:'POST'});
@@ -28,10 +44,11 @@ const Sidebar = ({ view, setView, selectedProject, setSelectedProject, selectedT
     }
   };
   const navItems = [
-    { id: 'all',     label: '所有对话', icon: 'message', count: counts.all },
-    { id: 'pinned',  label: '置顶',     icon: 'pin',     count: counts.pinned },
-    { id: 'recent',  label: '最近',     icon: 'clock',   count: counts.recent },
-    { id: 'archive', label: '归档',     icon: 'archive', count: counts.archive },
+    { id: 'all',     label: '所有对话', icon: 'message',  count: counts.all },
+    { id: 'pinned',  label: '置顶',     icon: 'pin',      count: counts.pinned },
+    { id: 'recent',  label: '最近',     icon: 'clock',    count: counts.recent },
+    { id: 'archive', label: '归档',     icon: 'archive',  count: counts.archive },
+    { id: 'costs',   label: '用量',     icon: 'sparkles' },
   ];
 
   const go = (v, extra = {}) => {
@@ -48,10 +65,9 @@ const Sidebar = ({ view, setView, selectedProject, setSelectedProject, selectedT
         <div className="brand-name"><span className="zh">Claude Manager</span></div>
       </div>
 
-      <button className="new-chat-btn" onClick={() => window.refreshAll()} title="重新扫描会话 + 校验 Claude 登录">
+      <button className="new-chat-btn" onClick={onNewChat} disabled={newChatBusy} title="新建对话">
         <Icon name="plus" size={14}/>
-        <span>刷新数据</span>
-        <kbd>⌘R</kbd>
+        <span>{newChatBusy ? '启动中' : '新建对话'}</span>
       </button>
 
       <div className="side-section">

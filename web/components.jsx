@@ -36,6 +36,7 @@ const Icon = ({ name, size = 16, stroke = 1.75, style }) => {
     back: <><path d="M19 12H5"/><path d="m12 19-7-7 7-7"/></>,
     export: <><path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></>,
     copy: <><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></>,
+    edit: <><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></>,
   };
   return (
     <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={stroke} strokeLinecap="round" strokeLinejoin="round" style={style}>
@@ -93,7 +94,7 @@ const ConvPreviewPopover = ({ preview }) => {
   if (left + W + pad > vw) left = Math.max(pad, x - W - 18);
   if (top + H + pad > vh)  top  = Math.max(pad, y - H - 12);
 
-  const firstMsgs = (msgs || []).filter(m => m.role !== 'summary' && !m.toolResult).slice(0, 6);
+  const recentMsgs = (msgs || []).filter(m => m.role !== 'summary' && !m.toolResult).slice(-6);
 
   return (
     <div style={{
@@ -113,8 +114,8 @@ const ConvPreviewPopover = ({ preview }) => {
       </div>
       <div style={{padding: 10, overflowY: 'auto', flex: 1, fontSize: 12}}>
         {loading && <div style={{color: 'var(--ink-3)', textAlign: 'center', padding: 20}}>加载中…</div>}
-        {!loading && firstMsgs.length === 0 && <div style={{color:'var(--ink-3)', textAlign:'center', padding:20}}>无消息</div>}
-        {!loading && firstMsgs.map((m, i) => (
+        {!loading && recentMsgs.length === 0 && <div style={{color:'var(--ink-3)', textAlign:'center', padding:20}}>无消息</div>}
+        {!loading && recentMsgs.map((m, i) => (
           <div key={i} style={{
             padding: '6px 10px', marginBottom: 6, borderRadius: 6,
             background: m.role === 'user' ? 'var(--accent-soft)' : 'var(--bg-sunk)',

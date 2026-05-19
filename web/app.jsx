@@ -9,6 +9,35 @@ const TWEAK_DEFAULTS = /*EDITMODE-BEGIN*/{
 
 const App = () => {
   const [data, setData] = useState(window.APP_DATA);
+  const commitData = (updater) => {
+    setData(prev => {
+      const next = typeof updater === 'function' ? updater(prev) : updater;
+      window.APP_DATA = next;
+      return next;
+    });
+  };
+  const recountTags = (tags, conversations) => {
+    const counts = {};
+    for (const c of conversations) {
+      for (const t of c.tags || []) counts[t] = (counts[t] || 0) + 1;
+    }
+    return tags.map(t => ({ ...t, count: counts[t.id] || 0 }));
+  };
+  const updateConversations = (convIds, updater) => {
+    const ids = new Set(Array.isArray(convIds) ? convIds : [convIds]);
+    commitData(prev => {
+      const conversations = prev.conversations.map(c => ids.has(c.id) ? updater(c) : c);
+      return {
+        ...prev,
+        conversations,
+        tags: recountTags(prev.tags, conversations),
+        projects: prev.projects.map(p => ({
+          ...p,
+          convs: conversations.filter(c => c.project === p.id && !c.tags.includes('archive')).length,
+        })),
+      };
+    });
+  };
   const reloadData = async () => {
     const r = await fetch('/api/sessions');
     const raw = await r.json();
@@ -18,14 +47,18 @@ const App = () => {
   };
   const removeFromUi = (convIds) => {
     const ids = new Set(Array.isArray(convIds) ? convIds : [convIds]);
-    setData(prev => ({
-      ...prev,
-      conversations: prev.conversations.filter(c => !ids.has(c.id)),
-      projects: prev.projects.map(p => ({
-        ...p,
-        convs: prev.conversations.filter(c => c.project === p.id && !ids.has(c.id)).length,
-      })),
-    }));
+    commitData(prev => {
+      const conversations = prev.conversations.filter(c => !ids.has(c.id));
+      return {
+        ...prev,
+        conversations,
+        tags: recountTags(prev.tags, conversations),
+        projects: prev.projects.map(p => ({
+          ...p,
+          convs: conversations.filter(c => c.project === p.id && !c.tags.includes('archive')).length,
+        })),
+      };
+    });
   };
 
   // Persistent state
@@ -43,28 +76,8 @@ const App = () => {
   const [searchQuery, setSearchQuery] = useState('');
   const [searchOpen, setSearchOpen] = useState(false);
   const [preview, setPreview] = useState(null); // { conv, x, y, msgs, loading }
-  const [merging, setMerging] = useState(false);
+  const [tagPicker, setTagPicker] = useState(null); // { tags, resolve }
   const scrollRef = React.useRef(0);
-
-  const mergeTargets = async (targets) => {
-    setMerging(true);
-    try {
-      const r = await fetch('/api/merge', {method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({ targets })});
-      const d = await r.json().catch(() => null);
-      if (await window.handleAuthGate(d)) return;
-      if (!r.ok || !d || !d.ok) {
-        const msg = (d && d.error) || `HTTP ${r.status}`;
-        window.dialog.alert('合并失败: ' + String(msg).slice(0, 400), {title:'合并失败', danger:true});
-        return;
-      }
-      window.dialog.alert(`已生成合并摘要 (${(d.bytes/1024).toFixed(1)} KB,${d.count} 条)\n保存到:\n${d.path}`, {title:'合并完成'});
-    } catch (e) {
-      window.dialog.alert('合并异常: ' + e, {title:'合并异常', danger:true});
-    } finally {
-      setMerging(false);
-    }
-  };
 
   const handlePreview = (conv, pos) => {
     if (!conv) { setPreview(null); return; }
@@ -82,7 +95,9 @@ const App = () => {
     return () => window.removeEventListener('mouseup', up);
   }, []);
 
-  // Poll active-sessions every 20s; update conversations' active flag in place
+  // Poll active-sessions every 20s; update conversations' active flag in place,
+  // and fire a Windows toast when a session transitions active → inactive.
+  const prevActiveRef = React.useRef(null);
   useEffect(() => {
     let stopped = false;
     const tick = async () => {
@@ -91,6 +106,14 @@ const App = () => {
         const d = await r.json();
         if (stopped) return;
         const activeSet = new Set((d.active || []).map(a => a.project + '|' + a.sid));
+        // Detect endings: ids that were in prev but no longer in current.
+        const prev = prevActiveRef.current;
+        if (prev) {
+          for (const id of prev) {
+            if (!activeSet.has(id)) notifySessionEnded(id);
+          }
+        }
+        prevActiveRef.current = activeSet;
         setData(prev => {
           let changed = false;
           const next = prev.conversations.map(c => {
@@ -103,6 +126,26 @@ const App = () => {
         });
       } catch {}
     };
+    const notifySessionEnded = (cid) => {
+      // Latest snapshot of prefs/data via refs-via-closure is fine — read fresh from localStorage.
+      let p = {}; try { p = JSON.parse(localStorage.getItem('cm.prefs') || '{}'); } catch {}
+      if (p.sessionEndNotify === false) return; // opt-out (default on)
+      const conv = (window.APP_DATA?.conversations || []).find(c => c.id === cid);
+      const title = conv ? conv.title : '对话已结束';
+      const body  = conv ? `${conv.title.slice(0, 80)} · 已停止活动` : '一个对话刚刚结束活动';
+      // Try in-page Notification API first (instant, no PowerShell spawn).
+      if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
+        try { new Notification('Claude Manager', { body: title }); return; } catch {}
+      }
+      fetch('/api/notify', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title: 'Claude 对话已结束', body: title }),
+      }).catch(() => {});
+    };
+    if (typeof Notification !== 'undefined' && Notification.permission === 'default') {
+      try { Notification.requestPermission(); } catch {}
+    }
     tick();
     const id = setInterval(tick, 20_000);
     return () => { stopped = true; clearInterval(id); };
@@ -117,6 +160,95 @@ const App = () => {
     setOpenConvId(null);
     requestAnimationFrame(() => window.scrollTo(0, scrollRef.current));
   };
+  const archiveSelected = (archived) => {
+    if (!selected.length) return;
+    window.APP_STATE_API.archiveConversations(selected, archived);
+    updateConversations(selected, c => {
+      const tags = archived
+        ? Array.from(new Set([...(c.tags || []), 'archive']))
+        : (c.tags || []).filter(t => t !== 'archive');
+      return { ...c, tags };
+    });
+    setSelected([]);
+  };
+  const renameSelected = async () => {
+    if (selected.length !== 1) return;
+    const conv = data.conversations.find(c => c.id === selected[0]);
+    if (!conv) return;
+    const name = await window.dialog.prompt(
+      '输入新的会话名称:',
+      { title: '重命名会话', defaultValue: conv.title, placeholder: conv.originalTitle || conv.title }
+    );
+    if (name === null) return;
+    const next = name.trim().slice(0, 120);
+    if (!next) return;
+    window.APP_STATE_API.renameConversation(conv.id, next);
+    updateConversations(conv.id, c => ({ ...c, title: next }));
+    setSelected([]);
+  };
+  const setConversationTags = (convIds, tagsOrUpdater) => {
+    const ids = new Set(Array.isArray(convIds) ? convIds : [convIds]);
+    commitData(prev => {
+      const conversations = prev.conversations.map(c => {
+        if (!ids.has(c.id)) return c;
+        const rawNext = typeof tagsOrUpdater === 'function' ? tagsOrUpdater(c.tags || [], c) : tagsOrUpdater;
+        const next = Array.from(new Set((rawNext || []).filter(Boolean)));
+        window.APP_STATE_API.setTags(c.id, next);
+        return { ...c, tags: next };
+      });
+      return {
+        ...prev,
+        conversations,
+        tags: recountTags(prev.tags, conversations),
+        projects: prev.projects.map(p => ({
+          ...p,
+          convs: conversations.filter(c => c.project === p.id && !c.tags.includes('archive')).length,
+        })),
+      };
+    });
+  };
+  const createTag = (name) => {
+    const clean = String(name || '').trim();
+    if (!clean) return null;
+    const id = window.APP_STATE_API.addTag(clean);
+    let created = null;
+    try {
+      created = (JSON.parse(localStorage.getItem('cm.tags') || '[]') || []).find(t => t.id === id);
+    } catch {}
+    created = created || { id, name: clean, color: ((data.tags.length) % 6) + 1, count: 0 };
+    commitData(prev => ({
+      ...prev,
+      tags: recountTags([...prev.tags.filter(t => t.id !== id), created], prev.conversations),
+    }));
+    return id;
+  };
+  const pickTagId = async (excludeIds = []) => {
+    const exclude = new Set(Array.isArray(excludeIds) ? excludeIds : []);
+    const regularTags = data.tags.filter(t => t.id !== 'archive' && !exclude.has(t.id));
+    if (!regularTags.length) {
+      await window.dialog.alert('没有可选标签。请先在左侧标签栏新建标签。', {title:'没有可选标签'});
+      return null;
+    }
+    return await new Promise(resolve => {
+      setTagPicker(prev => {
+        if (prev && prev.resolve) prev.resolve(null);
+        return { tags: regularTags, resolve };
+      });
+    });
+  };
+  const closeTagPicker = (tagId = null) => {
+    if (!tagPicker) return;
+    const resolve = tagPicker.resolve;
+    setTagPicker(null);
+    resolve(tagId);
+  };
+  const tagSelected = async () => {
+    if (!selected.length) return;
+    const tagId = await pickTagId();
+    if (!tagId) return;
+    setConversationTags(selected, current => Array.from(new Set([...(current || []), tagId])));
+    setSelected([]);
+  };
 
   // Tweaks
   const [theme, setTheme] = useState(TWEAK_DEFAULTS.theme);
@@ -124,17 +256,38 @@ const App = () => {
   const [accent, setAccent] = useState(TWEAK_DEFAULTS.accent);
   const [tweaksOpen, setTweaksOpen] = useState(false);
 
+  // Prefs (from settings page) — persisted to localStorage as a single object so
+  // data.js can read it before React mounts.
+  const [prefs, setPrefsRaw] = useState(() => {
+    try { return JSON.parse(localStorage.getItem('cm.prefs') || '{}'); } catch { return {}; }
+  });
+  const setPrefs = (patch) => setPrefsRaw(prev => {
+    const next = { ...prev, ...patch };
+    localStorage.setItem('cm.prefs', JSON.stringify(next));
+    return next;
+  });
+
   useEffect(() => localStorage.setItem('cm.view', view), [view]);
   useEffect(() => { if (selectedProject) localStorage.setItem('cm.project', selectedProject); else localStorage.removeItem('cm.project'); }, [selectedProject]);
   useEffect(() => { if (selectedTag) localStorage.setItem('cm.tag', selectedTag); else localStorage.removeItem('cm.tag'); }, [selectedTag]);
   useEffect(() => localStorage.setItem('cm.viewMode', viewMode), [viewMode]);
   useEffect(() => { if (openConvId) localStorage.setItem('cm.openConv', openConvId); else localStorage.removeItem('cm.openConv'); }, [openConvId]);
 
-  // Theme application
+  // Theme application — when "follow system" is on, the system dark/light pref wins.
   useEffect(() => {
-    if (theme === 'light') document.documentElement.removeAttribute('data-theme');
-    else document.documentElement.setAttribute('data-theme', theme);
-  }, [theme]);
+    const apply = (t) => {
+      if (t === 'light') document.documentElement.removeAttribute('data-theme');
+      else document.documentElement.setAttribute('data-theme', t);
+    };
+    if (prefs.followSystem) {
+      const mq = window.matchMedia('(prefers-color-scheme: dark)');
+      const sync = () => apply(mq.matches ? 'dark' : 'light');
+      sync();
+      mq.addEventListener('change', sync);
+      return () => mq.removeEventListener('change', sync);
+    }
+    apply(theme);
+  }, [theme, prefs.followSystem]);
 
   // Accent application
   useEffect(() => {
@@ -185,9 +338,9 @@ const App = () => {
 
   // Counts
   const counts = useMemo(() => ({
-    all: data.conversations.length,
-    pinned: data.conversations.filter(c => c.pinned).length,
-    recent: 8,
+    all: data.conversations.filter(c => !c.tags.includes('archive')).length,
+    pinned: data.conversations.filter(c => c.pinned && !c.tags.includes('archive')).length,
+    recent: Math.min(8, data.conversations.filter(c => !c.tags.includes('archive')).length),
     archive: data.conversations.filter(c => c.tags.includes('archive')).length,
   }), [data]);
 
@@ -206,6 +359,7 @@ const App = () => {
     }
     if (searchOpen) return [{ label: '搜索', current: true }];
     if (view === 'settings') return [{ label: '设置', current: true }];
+    if (view === 'costs') return [{ label: '用量', current: true }];
     if (project) return [
       { label: '项目', onClick: () => { setSelectedProject(null); setView('all'); } },
       { label: project.name, current: true }
@@ -214,9 +368,12 @@ const App = () => {
       const t = data.tags.find(x => x.id === selectedTag);
       return [{ label: '标签', onClick: () => { setSelectedTag(null); setView('all'); } }, { label: `# ${t?.name}`, current: true }];
     }
-    const names = { all: '所有对话', pinned: '置顶', recent: '最近', archive: '归档' };
+    const names = { all: '所有对话', pinned: '置顶', recent: '最近', archive: '归档', costs: '用量' };
     return [{ label: names[view] || '所有对话', current: true }];
   })();
+  const selectedConversations = selected.map(id => data.conversations.find(c => c.id === id)).filter(Boolean);
+  const bulkArchiveTarget = selectedConversations.some(c => !c.tags.includes('archive'));
+  const bulkArchiveLabel = bulkArchiveTarget ? '归档' : '取消归档';
 
   return (
     <div className="app">
@@ -265,13 +422,6 @@ const App = () => {
           </div>
         </div>
 
-        {merging && (
-          <div className="assistant-status">
-            <span className="spinner"/>
-            <span>Claude 正在归纳合并,请稍候…</span>
-          </div>
-        )}
-
         <div className={selected.length > 0 ? 'bulk-mode' : ''}>
           {searchOpen ? (
             <SearchView
@@ -286,6 +436,8 @@ const App = () => {
               data={data}
               onBack={handleCloseConv}
               onDeleted={(id) => { removeFromUi(id); setOpenConvId(null); }}
+              onTagsChanged={setConversationTags}
+              onPickTag={pickTagId}
             />
           ) : view === 'settings' ? (
             <SettingsView
@@ -295,7 +447,11 @@ const App = () => {
               setAccent={setAccent}
               density={density}
               setDensity={setDensity}
+              prefs={prefs}
+              setPrefs={setPrefs}
             />
+          ) : view === 'costs' ? (
+            <CostsView/>
           ) : project ? (
             <ProjectView project={project} data={data} onOpen={handleOpenConv}
               selected={selected} setSelected={setSelected} onPreview={handlePreview}/>
@@ -320,11 +476,42 @@ const App = () => {
 
       {preview && <ConvPreviewPopover preview={preview}/>}
 
+      {tagPicker && (
+        <div className="cm-modal-overlay" onMouseDown={(e) => {
+          if (e.target === e.currentTarget) closeTagPicker(null);
+        }}>
+          <div className="cm-modal tag-picker-modal">
+            <div className="cm-modal-title">选择标签</div>
+            <div className="tag-picker-list">
+              {tagPicker.tags.map(t => (
+                <button key={t.id} className="tag-picker-option" onClick={() => closeTagPicker(t.id)}>
+                  <Tag tag={t.id} tags={data.tags}/>
+                  <span className="tag-picker-name">{t.name}</span>
+                  <span className="tag-picker-count">{t.count || 0}</span>
+                </button>
+              ))}
+            </div>
+            <div className="cm-modal-actions">
+              <button className="cm-modal-btn" onClick={() => closeTagPicker(null)}>取消</button>
+            </div>
+          </div>
+        </div>
+      )}
+
       <DialogHost/>
 
       {/* Bulk action bar */}
       <div className={`bulk-bar ${selected.length > 0 ? 'show' : ''}`}>
         <span className="count-pill">已选 {selected.length}</span>
+        {selected.length === 1 && (
+          <button onClick={renameSelected}><Icon name="edit" size={13}/> 重命名</button>
+        )}
+        <button onClick={tagSelected}>
+          <Icon name="tag" size={13}/> 标签
+        </button>
+        <button onClick={() => archiveSelected(bulkArchiveTarget)}>
+          <Icon name="archive" size={13}/> {bulkArchiveLabel}
+        </button>
         <button onClick={() => {
           for (const id of selected) {
             const c = data.conversations.find(x => x.id === id);
@@ -333,22 +520,6 @@ const App = () => {
           setSelected([]);
           window.location.reload();
         }}><Icon name="pin" size={13}/> 置顶</button>
-        <button onClick={async () => {
-          for (const id of selected) {
-            const c = data.conversations.find(x => x.id === id); if (!c) continue;
-            window.open(`/api/export/${encodeURIComponent(c.project)}/${encodeURIComponent(c.sid)}?format=md`);
-          }
-        }}><Icon name="export" size={13}/> 导出 MD</button>
-        <button onClick={async () => {
-          const targets = selected.map(id => {
-            const c = data.conversations.find(x => x.id === id);
-            return c ? { project: c.project, sid: c.sid } : null;
-          }).filter(Boolean);
-          const ok = await window.dialog.confirm(
-            `让 Claude 把这 ${targets.length} 条合并为摘要 Markdown?`,
-            {title:'合并摘要', okLabel:'开始合并'});
-          if (ok) mergeTargets(targets);
-        }}><Icon name="sparkles" size={13}/> 合并摘要</button>
         <button className="danger" onClick={async () => {
           const ok = await window.dialog.confirm(
             `确认删除选中的 ${selected.length} 条对话?\n此操作不可恢复。`,
