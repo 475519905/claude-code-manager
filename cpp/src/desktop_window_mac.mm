@@ -8,14 +8,12 @@
 #include <filesystem>
 #include <string>
 
-namespace {
-
 constexpr CGFloat kDefaultWidth = 2560.0;
 constexpr CGFloat kDefaultHeight = 1440.0;
 constexpr CGFloat kMinWidth = 900.0;
 constexpr CGFloat kMinHeight = 560.0;
 
-NSString* ns_string(const std::string& value) {
+static NSString* ns_string(const std::string& value) {
     return [[NSString alloc] initWithBytes:value.data()
                                     length:value.size()
                                   encoding:NSUTF8StringEncoding];
@@ -51,7 +49,7 @@ NSString* ns_string(const std::string& value) {
                                               styleMask:style
                                                 backing:NSBackingStoreBuffered
                                                   defer:NO];
-    self.window.title = self.windowTitle ?: @"Conversation Manager";
+    self.window.title = self.windowTitle ? self.windowTitle : @"Conversation Manager";
     self.window.minSize = NSMakeSize(kMinWidth, kMinHeight);
     [self.window center];
 
@@ -61,7 +59,7 @@ NSString* ns_string(const std::string& value) {
     self.webView.UIDelegate = self;
     self.window.contentView = self.webView;
 
-    NSURL* url = [NSURL URLWithString:self.initialURL ?: @""];
+    NSURL* url = [NSURL URLWithString:(self.initialURL ? self.initialURL : @"")];
     if (url) {
         [self.webView loadRequest:[NSURLRequest requestWithURL:url]];
     }
@@ -89,9 +87,7 @@ createWebViewWithConfiguration:(WKWebViewConfiguration*)configuration
 
 @end
 
-ConvManagerAppDelegate* g_delegate = nil;
-
-} // namespace
+static ConvManagerAppDelegate* g_delegate = nil;
 
 int run_desktop_window(
     const std::string& title_utf8,
