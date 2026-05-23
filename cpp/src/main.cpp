@@ -60,7 +60,7 @@ struct Config {
     std::string app_name = is_codex ? "Codex Manager C++" : "Claude Manager C++";
     std::string host = "127.0.0.1";
     int port = is_codex ? 8766 : 8765;
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
     UiMode ui_mode = UiMode::Window;
 #else
     UiMode ui_mode = UiMode::Browser;
@@ -1717,6 +1717,12 @@ Config make_config(int argc, char** argv) {
         auto exe_web = cfg.exe_dir / "web";
         if (fs::is_directory(exe_web)) cfg.web_dir = exe_web;
     }
+#ifdef __APPLE__
+    if (!fs::is_directory(cfg.web_dir)) {
+        auto app_web = cfg.exe_dir.parent_path() / "Resources" / "web";
+        if (fs::is_directory(app_web)) cfg.web_dir = app_web;
+    }
+#endif
     if (!fs::is_directory(cfg.web_dir)) {
         auto cwd_web = fs::current_path() / "web";
         if (fs::is_directory(cwd_web)) cfg.web_dir = cwd_web;
@@ -2098,9 +2104,15 @@ int app_main(int argc, char** argv) {
         return 0;
     }
 
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
     if (cfg.ui_mode == UiMode::Window) {
-        auto profile_dir = cfg.index_file.parent_path() / "webview2";
+        auto profile_dir = cfg.index_file.parent_path() / (
+#ifdef _WIN32
+            "webview2"
+#else
+            "webkit"
+#endif
+        );
         std::error_code ec;
         fs::create_directories(profile_dir, ec);
         std::thread server_thread([&svr] { svr.listen_after_bind(); });

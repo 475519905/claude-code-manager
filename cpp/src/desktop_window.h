@@ -3,7 +3,7 @@
 #include <filesystem>
 #include <string>
 
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
 int run_desktop_window(
     const std::string& title_utf8,
     const std::string& url_utf8,

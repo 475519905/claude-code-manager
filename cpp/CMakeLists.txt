@@ -29,10 +29,17 @@ FetchContent_Declare(
 
 FetchContent_MakeAvailable(cpp_httplib nlohmann_json)
 
-add_executable(conv_manager_cpp
+set(CONV_MANAGER_SOURCES
   src/main.cpp
   src/desktop_window.cpp
 )
+
+if(APPLE)
+  enable_language(OBJCXX)
+  list(APPEND CONV_MANAGER_SOURCES src/desktop_window_mac.mm)
+endif()
+
+add_executable(conv_manager_cpp ${CONV_MANAGER_SOURCES})
 
 target_compile_definitions(conv_manager_cpp PRIVATE
   CONV_MANAGER_KIND="${MANAGER_KIND}"
@@ -64,6 +71,19 @@ if(WIN32)
     "${WEBVIEW2_LOADER_LIB}"
   )
   set_target_properties(conv_manager_cpp PROPERTIES WIN32_EXECUTABLE TRUE)
+endif()
+
+if(APPLE)
+  set_source_files_properties(src/desktop_window_mac.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+  target_link_libraries(conv_manager_cpp PRIVATE
+    "-framework Cocoa"
+    "-framework WebKit"
+  )
+  set_target_properties(conv_manager_cpp PROPERTIES
+    MACOSX_BUNDLE TRUE
+    MACOSX_BUNDLE_GUI_IDENTIFIER "local.codex.manager.cpp"
+    MACOSX_BUNDLE_BUNDLE_NAME "Codex Manager C++"
+  )
 endif()
 
 if(MSVC)
