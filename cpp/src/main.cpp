@@ -17,6 +17,7 @@
 #include <functional>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <regex>
@@ -91,18 +92,26 @@ struct Candidate {
 struct SearchEntry {
     double mtime = 0.0;
     std::uintmax_t size = 0;
-    std::string blob;
+    struct Record {
+        std::string role;
+        std::string text;
+        std::string lower;
+        std::string ts;
+    };
+    std::unordered_map<std::string, json> hit_cache;
 };
 
-struct SearchPrepared {
-    Candidate file;
-    std::string blob;
-    bool ok = false;
+struct DetailEntry {
+    double mtime = 0.0;
+    std::uintmax_t size = 0;
+    json detail;
 };
 
 std::mutex g_index_mutex;
 std::mutex g_search_mutex;
-std::unordered_map<std::string, SearchEntry> g_search_blobs;
+std::mutex g_detail_mutex;
+std::unordered_map<std::string, std::shared_ptr<SearchEntry>> g_search_blobs;
+std::unordered_map<std::string, DetailEntry> g_detail_cache;
 std::optional<json> g_index_cache;
 
 std::string as_string(const json& v) {
@@ -915,73 +924,64 @@ std::pair<json, json> load_session_summaries(const Config& cfg) {
     return {projects, sessions};
 }
 
-std::string build_search_blob(const Config& cfg, const Candidate& c) {
-    (void)cfg;
-    std::string raw;
-    if (!read_file(c.path, raw)) return "";
-    return lower_ascii(std::move(raw));
+void add_search_record(const Config& cfg, const json& obj, std::vector<SearchEntry::Record>& records) {
+    const auto t = field_string(obj, "type");
+    std::string role;
+    std::string text;
+    if (cfg.is_codex) {
+        if (t != "response_item") return;
+        const auto payload = field_object(obj, "payload");
+        const auto ptype = field_string(payload, "type");
+        if (ptype == "message") {
+            role = field_string(payload, "role");
+            if (role != "user" && role != "assistant") return;
+            text = extract_text(payload.contains("content") ? payload.at("content") : json());
+            if (role == "user" && is_internal_codex_text(text)) return;
+        } else if (ptype == "function_call" || ptype == "function_call_output") {
+            role = "tool";
+            text = codex_tool_text(payload);
+        } else {
+            return;
+        }
+    } else {
+        if (t == "summary") {
+            role = "summary";
+            text = field_string(obj, "summary");
+        } else if (t == "user" || t == "assistant") {
+            role = t;
+            const auto msg = field_object(obj, "message");
+            text = extract_text(msg.contains("content") ? msg.at("content") : json());
+        } else {
+            return;
+        }
+    }
+    if (text.empty()) return;
+    auto lower = lower_ascii(text);
+    if (lower.empty()) return;
+    records.push_back({role, std::move(text), std::move(lower), field_string(obj, "timestamp")});
 }
 
-SearchPrepared ensure_blob(const Config& cfg, const Candidate& c) {
+std::shared_ptr<SearchEntry> ensure_search_entry(const Candidate& c) {
     const auto key = c.project + "/" + c.sid + "/" + relative_key(c);
     {
         std::lock_guard<std::mutex> lock(g_search_mutex);
         auto it = g_search_blobs.find(key);
-        if (it != g_search_blobs.end() && it->second.mtime == c.mtime && it->second.size == c.size) {
-            return SearchPrepared{c, it->second.blob, true};
+        if (it != g_search_blobs.end() && it->second && it->second->mtime == c.mtime && it->second->size == c.size) {
+            return it->second;
         }
     }
-    auto blob = build_search_blob(cfg, c);
+    auto entry = std::make_shared<SearchEntry>();
+    entry->mtime = c.mtime;
+    entry->size = c.size;
     {
         std::lock_guard<std::mutex> lock(g_search_mutex);
-        g_search_blobs[key] = SearchEntry{c.mtime, c.size, blob};
+        g_search_blobs[key] = entry;
     }
-    return SearchPrepared{c, blob, true};
+    return entry;
 }
 
-json search_snippets(const Config& cfg, const Candidate& c, const std::string& query, const std::string& qlower) {
+json search_snippets_uncached(const Config& cfg, const Candidate& c, const std::string& query, const std::string& qlower) {
     json hits = json::array();
-    auto consider = [&](const json& obj) {
-        if (hits.size() >= 3) return;
-        const auto t = field_string(obj, "type");
-        std::string role;
-        std::string text;
-        if (cfg.is_codex) {
-            if (t != "response_item") return;
-            const auto payload = field_object(obj, "payload");
-            const auto ptype = field_string(payload, "type");
-            if (ptype == "message") {
-                role = field_string(payload, "role");
-                if (role != "user" && role != "assistant") return;
-                text = extract_text(payload.contains("content") ? payload.at("content") : json());
-                if (role == "user" && is_internal_codex_text(text)) return;
-            } else if (ptype == "function_call" || ptype == "function_call_output") {
-                role = "tool";
-                text = codex_tool_text(payload);
-            } else {
-                return;
-            }
-        } else {
-            if (t == "summary") {
-                role = "summary";
-                text = field_string(obj, "summary");
-            } else if (t == "user" || t == "assistant") {
-                role = t;
-                const auto msg = field_object(obj, "message");
-                text = extract_text(msg.contains("content") ? msg.at("content") : json());
-            } else {
-                return;
-            }
-        }
-        if (text.empty()) return;
-        const auto lower = lower_ascii(text);
-        const auto pos = lower.find(qlower);
-        if (pos == std::string::npos) return;
-        const auto begin = pos > 40 ? pos - 40 : 0;
-        const auto end = std::min(text.size(), pos + query.size() + 80);
-        hits.push_back({{"role", role}, {"snippet", utf8_slice(text, begin, end)}, {"ts", field_string(obj, "timestamp")}});
-    };
-
     std::ifstream in(c.path, std::ios::binary);
     if (!in) return hits;
     std::string line;
@@ -989,12 +989,36 @@ json search_snippets(const Config& cfg, const Candidate& c, const std::string& q
         if (!line.empty() && line.back() == '\r') line.pop_back();
         if (lower_ascii(line).find(qlower) == std::string::npos) continue;
         auto obj = json::parse(line, nullptr, false);
-        if (!obj.is_discarded()) consider(obj);
+        if (obj.is_discarded()) continue;
+        std::vector<SearchEntry::Record> records;
+        add_search_record(cfg, obj, records);
+        for (const auto& record : records) {
+            if (hits.size() >= 3) break;
+            const auto pos = record.lower.find(qlower);
+            if (pos == std::string::npos) continue;
+            const auto begin = pos > 40 ? pos - 40 : 0;
+            const auto end = std::min(record.text.size(), pos + query.size() + 80);
+            hits.push_back({{"role", record.role}, {"snippet", utf8_slice(record.text, begin, end)}, {"ts", record.ts}});
+        }
     }
     return hits;
 }
 
-json build_session_detail(const Config& cfg, const Candidate& c) {
+json search_snippets(const Config& cfg, const Candidate& c, std::shared_ptr<SearchEntry> entry, const std::string& query, const std::string& qlower) {
+    if (entry) {
+        std::lock_guard<std::mutex> lock(g_search_mutex);
+        auto it = entry->hit_cache.find(qlower);
+        if (it != entry->hit_cache.end()) return it->second;
+    }
+    auto hits = search_snippets_uncached(cfg, c, query, qlower);
+    if (entry) {
+        std::lock_guard<std::mutex> lock(g_search_mutex);
+        entry->hit_cache[qlower] = hits;
+    }
+    return hits;
+}
+
+json build_session_detail_uncached(const Config& cfg, const Candidate& c) {
     json messages = json::array();
     std::string cwd;
     std::string git_branch;
@@ -1060,6 +1084,23 @@ json build_session_detail(const Config& cfg, const Candidate& c) {
         });
     }
     return {{"project", c.project}, {"sid", c.sid}, {"cwd", cwd}, {"gitBranch", git_branch}, {"messages", messages}};
+}
+
+json build_session_detail(const Config& cfg, const Candidate& c) {
+    const auto key = c.project + "/" + c.sid + "/" + relative_key(c);
+    {
+        std::lock_guard<std::mutex> lock(g_detail_mutex);
+        auto it = g_detail_cache.find(key);
+        if (it != g_detail_cache.end() && it->second.mtime == c.mtime && it->second.size == c.size) {
+            return it->second.detail;
+        }
+    }
+    auto detail = build_session_detail_uncached(cfg, c);
+    {
+        std::lock_guard<std::mutex> lock(g_detail_mutex);
+        g_detail_cache[key] = DetailEntry{c.mtime, c.size, detail};
+    }
+    return detail;
 }
 
 std::pair<double, std::array<double, 4>> claude_price(const std::string& model) {
@@ -1556,23 +1597,34 @@ std::vector<fs::path> path_dirs() {
     return out;
 }
 
-std::optional<fs::path> find_cli(const Config& cfg, const std::string& name) {
+fs::path sidecar_path_for(const Config& cfg, const std::string& name) {
+#ifdef _WIN32
+    return cfg.exe_dir / (lower_ascii(name) == "codex" ? "Codex.exe" : "Claude.exe");
+#else
+    return cfg.exe_dir / name;
+#endif
+}
+
+std::optional<fs::path> find_cli(const Config& cfg, const std::string& name, bool allow_sidecar = false) {
     std::vector<std::string> names;
 #ifdef _WIN32
     names = {name + ".exe", name + ".cmd", name + ".bat", name};
 #else
     names = {name};
 #endif
-    auto sidecar = cfg.exe_dir / (name == "codex" ? "Codex.exe" : "Claude.exe");
+    auto sidecar = sidecar_path_for(cfg, name);
     std::error_code ec;
     auto sidecar_key = lower_ascii(path_string(fs::weakly_canonical(sidecar, ec)));
     auto try_path = [&](const fs::path& p) -> std::optional<fs::path> {
         if (!fs::is_regular_file(p)) return std::nullopt;
         std::error_code pc_ec;
         auto p_key = lower_ascii(path_string(fs::weakly_canonical(p, pc_ec)));
-        if (!sidecar_key.empty() && p_key == sidecar_key) return std::nullopt;
+        if (!allow_sidecar && !sidecar_key.empty() && p_key == sidecar_key) return std::nullopt;
         return p;
     };
+    if (allow_sidecar) {
+        if (auto found = try_path(sidecar)) return found;
+    }
 #ifdef __APPLE__
     std::vector<fs::path> app_candidates;
     if (name == "codex") {
@@ -1611,7 +1663,7 @@ std::optional<fs::path> find_cli(const Config& cfg, const std::string& name) {
 }
 
 std::optional<fs::path> sidecar_exe(const Config& cfg) {
-    const auto p = cfg.exe_dir / (cfg.is_codex ? "Codex.exe" : "Claude.exe");
+    const auto p = sidecar_path_for(cfg, cfg.is_codex ? "codex" : "claude");
     if (fs::is_regular_file(p)) return p;
     return std::nullopt;
 }
@@ -1644,6 +1696,17 @@ fs::path write_transfer_file(const Config& cfg, const std::string& prefix, const
     auto path = cfg.index_file.parent_path() / name;
     write_text_file(path, text);
     return path;
+}
+
+std::string claude_launch_prompt(const std::string& full_prompt, const fs::path& full_prompt_path, size_t limit = 20000) {
+    const auto header =
+        "The full Codex transfer transcript is saved at:\n" +
+        path_string(full_prompt_path) +
+        "\n\nContinue the user's work in Claude Code. Use the transcript below first; "
+        "read the full file if more context is needed.\n\n";
+    const auto budget = std::max<size_t>(1000, limit > header.size() ? limit - header.size() : 1000);
+    if (full_prompt.size() <= budget) return header + full_prompt;
+    return header + "[Transcript excerpt: latest context only]\n\n" + full_prompt.substr(full_prompt.size() - budget);
 }
 
 void spawn_terminal(const Config& cfg, const fs::path& cwd, const std::string& command, const std::string& title) {
@@ -1724,6 +1787,42 @@ std::string session_markdown(const Config& cfg, const Candidate& c) {
 
 std::string session_cwd(const Config& cfg, const Candidate& c) {
     return field_string(build_session_detail(cfg, c), "cwd");
+}
+
+Candidate restore_codex_session_if_needed(const Config& cfg, Candidate c) {
+    if (!cfg.is_codex || is_relative_to(c.path, cfg.codex_sessions)) return c;
+
+    fs::path rel;
+    std::error_code ec;
+    if (c.storage == "backup") {
+        rel = fs::relative(c.path, c.root, ec);
+        if (ec || rel.empty()) rel = c.path.filename();
+    } else if (c.storage == "backup-archived") {
+        const std::regex rollout_date(R"(rollout-(\d{4})-(\d{2})-(\d{2})T)");
+        std::smatch m;
+        const auto name = c.path.filename().string();
+        if (std::regex_search(name, m, rollout_date) && m.size() >= 4) {
+            rel = fs::path(m[1].str()) / m[2].str() / m[3].str() / c.path.filename();
+        } else {
+            rel = fs::path("restored") / c.path.filename();
+        }
+    } else {
+        return c;
+    }
+
+    auto dest = cfg.codex_sessions / rel;
+    if (!fs::exists(dest)) {
+        fs::create_directories(dest.parent_path());
+        fs::copy_file(c.path, dest, fs::copy_options::none, ec);
+        if (ec) throw std::runtime_error("failed to restore session for resume: " + ec.message());
+    }
+    c.path = dest;
+    c.root = cfg.codex_sessions;
+    c.storage = "current";
+    c.priority = 1;
+    c.mtime = unix_mtime(c.path);
+    c.size = file_size_or_zero(c.path);
+    return c;
 }
 
 json read_json_file(const fs::path& path) {
@@ -1863,6 +1962,10 @@ void register_routes(httplib::Server& svr, const Config& cfg) {
             std::lock_guard<std::mutex> lock(g_search_mutex);
             g_search_blobs.clear();
         }
+        {
+            std::lock_guard<std::mutex> lock(g_detail_mutex);
+            g_detail_cache.clear();
+        }
         json_response(res, {{"ok", true}});
     });
 
@@ -1883,7 +1986,8 @@ void register_routes(httplib::Server& svr, const Config& cfg) {
         }
         const auto qlower = lower_ascii(query);
         const auto files = enumerate_files(cfg);
-        std::vector<SearchPrepared> prepared(files.size());
+        json results = json::array();
+        std::vector<json> result_items(files.size());
         std::atomic_size_t next{0};
         const auto workers = std::max<size_t>(1, std::min<size_t>(8, files.size()));
         std::vector<std::thread> threads;
@@ -1893,19 +1997,18 @@ void register_routes(httplib::Server& svr, const Config& cfg) {
                 while (true) {
                     const auto i = next.fetch_add(1);
                     if (i >= files.size()) break;
-                    prepared[i] = ensure_blob(cfg, files[i]);
+                    auto entry = ensure_search_entry(files[i]);
+                    auto hits = search_snippets(cfg, files[i], entry, query, qlower);
+                    if (!hits.empty()) {
+                        result_items[i] = {{"project", files[i].project}, {"sid", files[i].sid}, {"mtime", files[i].mtime}, {"hits", hits}};
+                    }
                 }
             });
         }
         for (auto& thread : threads) thread.join();
 
-        json results = json::array();
-        for (const auto& p : prepared) {
-            if (!p.ok || p.blob.find(qlower) == std::string::npos) continue;
-            auto hits = search_snippets(cfg, p.file, query, qlower);
-            if (!hits.empty()) {
-                results.push_back({{"project", p.file.project}, {"sid", p.file.sid}, {"mtime", p.file.mtime}, {"hits", hits}});
-            }
+        for (auto& item : result_items) {
+            if (!item.is_null()) results.push_back(std::move(item));
         }
         std::sort(results.begin(), results.end(), [](const json& a, const json& b) {
             return (a["mtime"].is_number() ? a["mtime"].get<double>() : 0.0) >
@@ -2028,11 +2131,12 @@ void register_routes(httplib::Server& svr, const Config& cfg) {
         }
         try {
             if (cfg.is_codex) {
-                auto codex = find_cli(cfg, "codex");
+                *c = restore_codex_session_if_needed(cfg, *c);
+                auto codex = find_cli(cfg, "codex", true);
                 if (!codex) throw std::runtime_error("codex CLI not found");
                 spawn_terminal(cfg, fs::path(cwd), cli_command(*codex, {"resume", c->sid}), "Codex Resume");
             } else {
-                auto claude = find_cli(cfg, "claude");
+                auto claude = find_cli(cfg, "claude", true);
                 if (!claude) throw std::runtime_error("claude CLI not found");
                 const auto command = cli_command(*claude, {
                     "--permission-mode", "bypassPermissions",
@@ -2064,20 +2168,21 @@ void register_routes(httplib::Server& svr, const Config& cfg) {
             return;
         }
         try {
-            auto claude = find_cli(cfg, "claude");
+            auto claude = find_cli(cfg, "claude", true);
             if (!claude) throw std::runtime_error("claude CLI not found");
             const auto prompt = "This is context imported from a local Codex session. Continue the user's work in Claude Code.\n\n" +
                 session_markdown(cfg, *c);
             const auto prompt_path = write_transfer_file(cfg, "codex-to-claude", c->sid, prompt);
-            const auto command = prompt_file_prelude(prompt_path) +
+            const auto launch_prompt = claude_launch_prompt(prompt, prompt_path);
+            const auto launch_prompt_path = write_transfer_file(cfg, "codex-to-claude-launch", c->sid, launch_prompt);
+            const auto command = prompt_file_prelude(launch_prompt_path) +
                 cli_command(*claude, {
                     "--add-dir", path_string(prompt_path.parent_path()),
                     "--permission-mode", "bypassPermissions",
-                    "--dangerously-skip-permissions",
                     "--"
-                }) + " " + prompt_file_arg(prompt_path);
+                }) + " " + prompt_file_arg(launch_prompt_path);
             spawn_terminal(cfg, fs::path(cwd), command, "Claude");
-            json_response(res, {{"ok", true}, {"cwd", cwd}, {"promptPath", path_string(prompt_path)}});
+            json_response(res, {{"ok", true}, {"cwd", cwd}, {"promptPath", path_string(prompt_path)}, {"launchPromptPath", path_string(launch_prompt_path)}});
         } catch (const std::exception& e) {
             error_response(res, 500, e.what());
         }
@@ -2100,7 +2205,7 @@ void register_routes(httplib::Server& svr, const Config& cfg) {
             return;
         }
         try {
-            auto codex = find_cli(cfg, "codex");
+            auto codex = find_cli(cfg, "codex", true);
             if (!codex) throw std::runtime_error("codex CLI not found");
             const auto md_path = fs::path(cwd) / ("_claude_manager_" + c->sid + ".md");
             if (!write_text_file(md_path, session_markdown(cfg, *c))) throw std::runtime_error("failed to write transfer markdown");
