@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-APP_NAME="CodexManagerCpp"
+APP_NAME="CodexManager"
 MANAGER_KIND="${MANAGER_KIND:-codex}"
 ARCH="${ARCH:-$(uname -m)}"
 BUILD_DIR="${ROOT}/build-mac"
