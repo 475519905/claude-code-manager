@@ -4,6 +4,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import shlex
 import subprocess
 import sys
 import threading
@@ -32,7 +33,7 @@ NEW_CHAT_EXE_NAME = "Claude.exe"
 INDEX_FILE = Path.home() / ".claude_manager" / "index.json"
 INDEX_VERSION = 1
 HOST = "127.0.0.1"
-PORT = 8765
+PORT = int(os.environ.get("CLAUDE_MANAGER_PORT", "8765"))
 CLAUDE_RESUME_PERMISSION_ARGS = [
     "--permission-mode",
     "bypassPermissions",
@@ -733,6 +734,32 @@ def _find_cli(name: str) -> str | None:
     """Locate a CLI binary without requiring shell resolution."""
     import shutil as _sh
 
+    def iter_path_dirs() -> list[str]:
+        dirs = os.environ.get("PATH", "").split(os.pathsep)
+        if sys.platform == "darwin":
+            home = Path.home()
+            dirs.extend([
+                "/opt/homebrew/bin",
+                "/usr/local/bin",
+                str(home / ".local" / "bin"),
+                str(home / ".npm-global" / "bin"),
+                str(home / "Library" / "pnpm"),
+                str(home / ".bun" / "bin"),
+                str(home / ".cargo" / "bin"),
+            ])
+        seen: set[str] = set()
+        out: list[str] = []
+        for raw in dirs:
+            if not raw:
+                continue
+            expanded = str(Path(raw).expanduser())
+            key = os.path.normcase(expanded)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(expanded)
+        return out
+
     def same_path(a: Path, b: Path) -> bool:
         try:
             return os.path.normcase(str(a.resolve())) == os.path.normcase(str(b.resolve()))
@@ -749,21 +776,32 @@ def _find_cli(name: str) -> str | None:
             return str(native.resolve())
 
     candidates = (f"{name}.exe", f"{name}.cmd", name) if sys.platform.startswith("win") else (name,)
+    path_dirs = iter_path_dirs()
     for candidate in candidates:
-        for raw_dir in os.environ.get("PATH", "").split(os.pathsep):
-            if not raw_dir:
-                continue
+        for raw_dir in path_dirs:
             p = Path(raw_dir).expanduser() / candidate
             try:
                 if p.is_file() and not is_sidecar(p):
                     return str(p.resolve())
             except OSError:
                 continue
-        p = _sh.which(candidate)
+        p = _sh.which(candidate, path=os.pathsep.join(path_dirs))
         if p:
             resolved = Path(p).resolve()
             if not is_sidecar(resolved):
                 return str(resolved)
+    if sys.platform == "darwin":
+        try:
+            proc = subprocess.run(
+                ["/bin/zsh", "-lc", f"command -v {shlex.quote(name)}"],
+                text=True, capture_output=True, timeout=3,
+            )
+            for line in (proc.stdout or "").splitlines():
+                p = Path(line.strip()).expanduser()
+                if p.is_file() and not is_sidecar(p):
+                    return str(p.resolve())
+        except Exception:
+            pass
     return None
 
 
@@ -794,10 +832,12 @@ def _spawn_terminal(cwd: str, command: str, title: str = "Claude Manager") -> No
         encoded = _b64.b64encode(ps_script.encode("utf-16le")).decode("ascii")
         subprocess.Popen(f'start "{title}" powershell -NoExit -EncodedCommand {encoded}', shell=True)
     elif sys.platform == "darwin":
-        script = f'tell app "Terminal" to do script "cd {json.dumps(cwd)} && {command}"'
+        shell_cmd = f"cd {shlex.quote(cwd)} && {command}"
+        script = f'tell application "Terminal" to do script {json.dumps(shell_cmd)}'
         subprocess.Popen(["osascript", "-e", script])
     else:
-        subprocess.Popen(["x-terminal-emulator", "-e", f"bash -c 'cd {cwd!r} && {command}; exec bash'"])
+        shell_cmd = f"cd {shlex.quote(cwd)} && {command}; exec bash"
+        subprocess.Popen(["x-terminal-emulator", "-e", f"bash -c {shlex.quote(shell_cmd)}"])
 
 
 def _run_cli(args: list[str], stdin_text: str = "", timeout: int = 90,
@@ -1110,12 +1150,9 @@ def api_codex():
         if sys.platform.startswith("win"):
             cmd = f"& {_shell_single_quote(codex_path)} {_shell_single_quote(prompt)}"
             _spawn_terminal(cwd, cmd, "Codex")
-        elif sys.platform == "darwin":
-            script = f'tell app "Terminal" to do script "cd {json.dumps(cwd)} && {json.dumps(codex_path)} {json.dumps(prompt)}"'
-            subprocess.Popen(["osascript", "-e", script])
         else:
-            subprocess.Popen(["x-terminal-emulator", "-e",
-                              f"bash -c 'cd {cwd!r} && {codex_path!r} {json.dumps(prompt)}; exec bash'"])
+            cmd = f"{shlex.quote(codex_path)} {shlex.quote(prompt)}"
+            _spawn_terminal(cwd, cmd, "Codex")
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
     return jsonify({"ok": True, "cwd": cwd, "mdPath": str(md_path)})
@@ -1152,12 +1189,9 @@ def api_resume():
                 f"& {_shell_single_quote(claude_path)} {resume_args_ps}"
             )
             _spawn_terminal(cwd, cmd, "Claude Resume")
-        elif sys.platform == "darwin":
-            script = f'tell app "Terminal" to do script "cd {json.dumps(cwd)} && {json.dumps(claude_path)} --permission-mode bypassPermissions --dangerously-skip-permissions --resume {json.dumps(sid)}"'
-            subprocess.Popen(["osascript", "-e", script])
         else:
-            subprocess.Popen(["x-terminal-emulator", "-e",
-                              f"bash -c 'cd {cwd!r} && {claude_path!r} --permission-mode bypassPermissions --dangerously-skip-permissions --resume {sid!r}; exec bash'"])
+            cmd = " ".join([shlex.quote(claude_path), *(shlex.quote(x) for x in resume_args)])
+            _spawn_terminal(cwd, cmd, "Claude Resume")
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
     return jsonify({"ok": True, "cwd": cwd, "command": cmdline})
@@ -1265,11 +1299,14 @@ def api_auth_status():
 
 @_route("/api/new-chat", methods=["POST"])
 def api_new_chat():
-    """Launch the sidecar Claude.exe placed next to ClaudeManager.exe."""
+    """Launch a new Claude chat."""
     global _NEW_CHAT_LAST_TS
-    exe = _new_chat_exe()
-    if not exe.exists():
+    exe = _new_chat_exe() if sys.platform.startswith("win") else None
+    cli = None if sys.platform.startswith("win") else _find_cli("claude")
+    if sys.platform.startswith("win") and exe and not exe.exists():
         return jsonify({"ok": False, "error": f"not found: {exe}"}), 404
+    if not sys.platform.startswith("win") and not cli:
+        return jsonify({"ok": False, "error": "claude CLI not found"}), 500
     with _NEW_CHAT_LOCK:
         now = time.monotonic()
         if now - _NEW_CHAT_LAST_TS < 2.0:
@@ -1279,19 +1316,26 @@ def api_new_chat():
         env = os.environ.copy()
         env.setdefault("HTTP_PROXY", _PROXY_URL)
         env.setdefault("HTTPS_PROXY", _PROXY_URL)
-        proc = subprocess.Popen(
-            [str(exe)],
-            cwd=str(exe.parent),
-            env=env,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            close_fds=True,
-        )
+        if sys.platform.startswith("win"):
+            proc = subprocess.Popen(
+                [str(exe)],
+                cwd=str(exe.parent),
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                close_fds=True,
+            )
+            pid = proc.pid
+            path = str(exe)
+        else:
+            _spawn_terminal(str(Path.home()), shlex.quote(cli), "Claude")
+            pid = None
+            path = cli
     except Exception as e:
         with _NEW_CHAT_LOCK:
             _NEW_CHAT_LAST_TS = 0.0
         return jsonify({"ok": False, "error": str(e)}), 500
-    return jsonify({"ok": True, "pid": proc.pid, "path": str(exe)})
+    return jsonify({"ok": True, "pid": pid, "path": path})
 
 
 @_route("/api/claude-login", methods=["POST"])
@@ -1312,12 +1356,8 @@ def api_claude_login():
             encoded = _b64.b64encode(ps_script.encode("utf-16le")).decode("ascii")
             cmd = f'start "Claude Login" powershell -NoExit -EncodedCommand {encoded}'
             subprocess.Popen(cmd, shell=True)
-        elif sys.platform == "darwin":
-            script = f'tell app "Terminal" to do script {json.dumps(f"{claude} /login")}'
-            subprocess.Popen(["osascript", "-e", script])
         else:
-            subprocess.Popen(["x-terminal-emulator", "-e",
-                              f"bash -c '{claude!r} /login; exec bash'"])
+            _spawn_terminal(str(Path.home()), f"{shlex.quote(claude)} /login", "Claude Login")
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
     return jsonify({"ok": True})
@@ -1616,6 +1656,37 @@ def _run_flask():
     srv.serve_forever()
 
 
+def _create_flask_server():
+    """Create the server before the UI starts so PORT always matches reality."""
+    global PORT
+    app = _init_flask()
+    from werkzeug.serving import make_server
+
+    def port_available(port: int) -> bool:
+        import socket
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.bind((HOST, port))
+            return True
+        except OSError:
+            return False
+
+    def fallback_server(reason: object):
+        global PORT
+        requested = PORT
+        srv = make_server(HOST, 0, app, threaded=True)
+        PORT = int(getattr(srv, "server_port", srv.server_address[1]))
+        print(f"Port {requested} unavailable ({reason}); using {PORT}")
+        return srv
+
+    if not port_available(PORT):
+        return fallback_server("already in use")
+    try:
+        return make_server(HOST, PORT, app, threaded=True)
+    except (OSError, SystemExit) as e:
+        return fallback_server(e)
+
+
 def _wait_for_server(timeout: float = 5.0) -> bool:
     import socket
     deadline = time.time() + timeout
@@ -1645,10 +1716,13 @@ body{display:flex;flex-direction:column;align-items:center;justify-content:cente
 def main():
     print("Claude Manager")
     print(f"Projects dir: {PROJECTS_DIR}")
-    print(f"Serving on http://{HOST}:{PORT}")
 
-    # Start Flask immediately so we can show the window before it's ready.
-    threading.Thread(target=_run_flask, daemon=True).start()
+    # Bind Flask before showing the UI so we never load a stale process on the
+    # default port. If the preferred port is busy, _create_flask_server selects
+    # an ephemeral fallback and updates PORT.
+    srv = _create_flask_server()
+    print(f"Serving on http://{HOST}:{PORT}")
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
 
     # Run the leftover purge off the critical path.
     def _bg_purge():
