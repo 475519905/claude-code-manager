@@ -421,10 +421,10 @@ const SettingsView = ({ theme, setTheme, accent, setAccent, density, setDensity,
               </div>
               <div className="setting-row">
                 <div className="setting-label" style={{display: 'flex', alignItems: 'center', gap: 14}}>
-                  <div className="avatar" style={{width: 44, height: 44, fontSize: 15}}>林</div>
+                  <div className="avatar" style={{width: 44, height: 44, fontSize: 15}}>L</div>
                   <div>
-                    <div className="name">林知远</div>
-                    <div className="desc" style={{fontFamily: 'var(--font-mono)'}}>zhihyuan.lin@mail.com</div>
+                    <div className="name">Local User</div>
+                    <div className="desc" style={{fontFamily: 'var(--font-mono)'}}>local account</div>
                   </div>
                 </div>
                 <button className="chip-btn">编辑</button>

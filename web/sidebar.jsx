@@ -1,7 +1,10 @@
 // Sidebar component
 const Sidebar = ({ view, setView, selectedProject, setSelectedProject, selectedTag, setSelectedTag, data, counts }) => {
   const [account, setAccount] = React.useState(null);
-  const profile = { name: '林知远', email: 'zhihyuan.lin@mail.com' };
+  const profile = {
+    name: account?.name || 'Claude',
+    email: account?.email || 'local Claude',
+  };
   const loadAccount = () =>
     fetch('/api/account').then(r => r.json()).then(setAccount).catch(() => {});
   React.useEffect(() => {
