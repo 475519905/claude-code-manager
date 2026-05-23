@@ -266,6 +266,29 @@ const App = () => {
     localStorage.setItem('cm.prefs', JSON.stringify(next));
     return next;
   });
+  const [managerSettings, setManagerSettingsRaw] = useState({ proxyUrl: '' });
+  useEffect(() => {
+    let cancelled = false;
+    fetch('/api/settings')
+      .then(r => r.ok ? r.json() : null)
+      .then(body => {
+        if (!cancelled && body && body.settings) setManagerSettingsRaw(body.settings);
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, []);
+  const setManagerSettings = (patch) => setManagerSettingsRaw(prev => {
+    const next = { ...prev, ...patch };
+    fetch('/api/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(next),
+    })
+      .then(r => r.ok ? r.json() : null)
+      .then(body => { if (body && body.settings) setManagerSettingsRaw(body.settings); })
+      .catch(() => {});
+    return next;
+  });
 
   useEffect(() => localStorage.setItem('cm.view', view), [view]);
   useEffect(() => { if (selectedProject) localStorage.setItem('cm.project', selectedProject); else localStorage.removeItem('cm.project'); }, [selectedProject]);
@@ -449,6 +472,8 @@ const App = () => {
               setDensity={setDensity}
               prefs={prefs}
               setPrefs={setPrefs}
+              managerSettings={managerSettings}
+              setManagerSettings={setManagerSettings}
             />
           ) : view === 'costs' ? (
             <CostsView/>

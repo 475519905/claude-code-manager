@@ -232,8 +232,24 @@ const SearchView = ({ data, query, setQuery, onOpen }) => {
   );
 };
 
-const SettingsView = ({ theme, setTheme, accent, setAccent, density, setDensity, prefs = {}, setPrefs = () => {} }) => {
+const SettingsView = ({
+  theme,
+  setTheme,
+  accent,
+  setAccent,
+  density,
+  setDensity,
+  prefs = {},
+  setPrefs = () => {},
+  managerSettings = {},
+  setManagerSettings = () => {},
+}) => {
   const [section, setSection] = React.useState('appearance');
+  const [proxyDraft, setProxyDraft] = React.useState(managerSettings.proxyUrl || '');
+  React.useEffect(() => {
+    setProxyDraft(managerSettings.proxyUrl || '');
+  }, [managerSettings.proxyUrl]);
+  const saveProxy = () => setManagerSettings({ proxyUrl: proxyDraft.trim() });
   const Toggle = ({ on, onChange }) => (
     <div
       className={`toggle ${on ? 'on' : ''}`}
@@ -257,6 +273,7 @@ const SettingsView = ({ theme, setTheme, accent, setAccent, density, setDensity,
           {[
             { id: 'appearance', label: '外观' },
             { id: 'general',    label: '通用' },
+            { id: 'network',    label: '网络' },
             { id: 'shortcuts',  label: '快捷键' },
             { id: 'export',     label: '导出与备份' },
             { id: 'account',    label: '账户' },
@@ -364,6 +381,33 @@ const SettingsView = ({ theme, setTheme, accent, setAccent, density, setDensity,
                   </div>
                 );
               })}
+            </div>
+          )}
+
+          {section === 'network' && (
+            <div className="settings-group">
+              <div className="settings-group-head">
+                <h3>网络</h3>
+                <p>配置由 Manager 启动的 Codex / Claude 终端代理。</p>
+              </div>
+              <div className="setting-row">
+                <div className="setting-label">
+                  <div className="name">代理地址</div>
+                  <div className="desc">留空时继承系统 HTTP(S)_PROXY；填写后优先用于新建、继续和发送到另一客户端。</div>
+                </div>
+                <div className="setting-control-row">
+                  <input
+                    className="text-input proxy-input"
+                    value={proxyDraft}
+                    placeholder="http://127.0.0.1:7890"
+                    onChange={(e) => setProxyDraft(e.target.value)}
+                    onBlur={saveProxy}
+                    onKeyDown={(e) => { if (e.key === 'Enter') saveProxy(); }}
+                  />
+                  <button className="chip-btn" onClick={saveProxy}>保存</button>
+                  <button className="chip-btn" onClick={() => { setProxyDraft(''); setManagerSettings({ proxyUrl: '' }); }}>清空</button>
+                </div>
+              </div>
             </div>
           )}
 

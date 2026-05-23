@@ -75,6 +75,7 @@ struct Config {
     fs::path codex_backup_archived;
     fs::path claude_projects;
     fs::path index_file;
+    fs::path settings_file;
     fs::path exe_dir;
 };
 
@@ -759,6 +760,52 @@ void save_index(const Config& cfg, const json& data) {
         out << data.dump();
         out.close();
         fs::rename(tmp, cfg.index_file);
+    } catch (...) {
+    }
+}
+
+std::string normalize_proxy_url(std::string value) {
+    value.erase(std::remove_if(value.begin(), value.end(), [](unsigned char c) {
+        return c == '\0' || c == '\r' || c == '\n';
+    }), value.end());
+    value = trim(value);
+    if (value.size() > 2048) value.resize(2048);
+    if (value.empty()) return "";
+    if (value.find("://") == std::string::npos) return "http://" + value;
+    return value;
+}
+
+json load_manager_settings(const Config& cfg) {
+    json settings = {{"proxyUrl", ""}};
+    std::ifstream in(cfg.settings_file, std::ios::binary);
+    if (in) {
+        std::ostringstream ss;
+        ss << in.rdbuf();
+        auto data = json::parse(ss.str(), nullptr, false);
+        if (data.is_object()) settings.update(data);
+    }
+    settings["proxyUrl"] = normalize_proxy_url(field_string(settings, "proxyUrl"));
+    return settings;
+}
+
+void save_manager_settings(const Config& cfg, const json& settings) {
+    try {
+        fs::create_directories(cfg.settings_file.parent_path());
+        json out = {
+            {"version", 1},
+            {"proxyUrl", normalize_proxy_url(field_string(settings, "proxyUrl"))}
+        };
+        const auto tmp = cfg.settings_file.string() + ".tmp";
+        {
+            std::ofstream file(tmp, std::ios::binary);
+            file << out.dump(2);
+        }
+        std::error_code ec;
+        fs::rename(tmp, cfg.settings_file, ec);
+        if (ec) {
+            fs::remove(cfg.settings_file, ec);
+            fs::rename(tmp, cfg.settings_file, ec);
+        }
     } catch (...) {
     }
 }
@@ -1535,6 +1582,77 @@ std::string win_arg_quote(const std::string& s) {
     return "\"" + replace_all(s, "\"", "\\\"") + "\"";
 }
 
+std::string sh_quote(const std::string& s);
+
+std::string powershell_proxy_prelude(const Config& cfg) {
+    const auto configured_proxy = field_string(load_manager_settings(cfg), "proxyUrl");
+    std::ostringstream script;
+    script
+        << "$configuredProxy = " << ps_quote(configured_proxy) << "\n"
+        << "$managerProxy = $configuredProxy\n"
+        << "$forceManagerProxy = -not [string]::IsNullOrWhiteSpace($configuredProxy)\n"
+        "if ([string]::IsNullOrWhiteSpace($managerProxy)) {\n"
+        "  $managerProxy = $env:MANAGER_PROXY_URL\n"
+        "  if (-not [string]::IsNullOrWhiteSpace($managerProxy)) { $forceManagerProxy = $true }\n"
+        "}\n"
+        "if ([string]::IsNullOrWhiteSpace($managerProxy)) {\n"
+        "  $managerProxy = $env:CONV_MANAGER_PROXY_URL\n"
+        "  if (-not [string]::IsNullOrWhiteSpace($managerProxy)) { $forceManagerProxy = $true }\n"
+        "}\n"
+        "if ([string]::IsNullOrWhiteSpace($managerProxy)) { $managerProxy = $env:HTTPS_PROXY }\n"
+        "if ([string]::IsNullOrWhiteSpace($managerProxy)) { $managerProxy = $env:HTTP_PROXY }\n"
+        "if ([string]::IsNullOrWhiteSpace($managerProxy)) { $managerProxy = $env:https_proxy }\n"
+        "if ([string]::IsNullOrWhiteSpace($managerProxy)) { $managerProxy = $env:http_proxy }\n"
+        "if ([string]::IsNullOrWhiteSpace($managerProxy)) {\n"
+        "  $client = New-Object System.Net.Sockets.TcpClient\n"
+        "  try {\n"
+        "    $async = $client.BeginConnect('127.0.0.1', 18001, $null, $null)\n"
+        "    if ($async.AsyncWaitHandle.WaitOne(250)) {\n"
+        "      $client.EndConnect($async)\n"
+        "      $managerProxy = 'http://127.0.0.1:18001'\n"
+        "    }\n"
+        "  } catch {\n"
+        "  } finally {\n"
+        "    $client.Close()\n"
+        "  }\n"
+        "}\n"
+        "if (-not [string]::IsNullOrWhiteSpace($managerProxy) -and $managerProxy -notmatch '^[A-Za-z][A-Za-z0-9+.-]*://') { $managerProxy = 'http://' + $managerProxy }\n"
+        "foreach ($proxyName in @('HTTP_PROXY','HTTPS_PROXY','http_proxy','https_proxy')) {\n"
+        "  if (-not [string]::IsNullOrWhiteSpace($managerProxy) -and ($forceManagerProxy -or [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($proxyName, 'Process')))) {\n"
+        "    Set-Item -Path \"Env:$proxyName\" -Value $managerProxy\n"
+        "  }\n"
+        "}\n"
+        "if ([string]::IsNullOrWhiteSpace($env:NO_PROXY)) { $env:NO_PROXY = 'localhost,127.0.0.1,::1' }\n"
+        "if ([string]::IsNullOrWhiteSpace($env:no_proxy)) { $env:no_proxy = $env:NO_PROXY }\n";
+    return script.str();
+}
+
+std::string shell_proxy_prelude(const Config& cfg) {
+    const auto configured_proxy = field_string(load_manager_settings(cfg), "proxyUrl");
+    std::ostringstream script;
+    script
+        << "manager_proxy=" << sh_quote(configured_proxy) << "\n"
+        << "force_manager_proxy=0\n"
+        << "if [ -n \"$manager_proxy\" ]; then force_manager_proxy=1; fi\n"
+        << "if [ -z \"$manager_proxy\" ]; then manager_proxy=\"${MANAGER_PROXY_URL:-}\"; if [ -n \"$manager_proxy\" ]; then force_manager_proxy=1; fi; fi\n"
+        << "if [ -z \"$manager_proxy\" ]; then manager_proxy=\"${CONV_MANAGER_PROXY_URL:-}\"; if [ -n \"$manager_proxy\" ]; then force_manager_proxy=1; fi; fi\n"
+        << "if [ -z \"$manager_proxy\" ]; then manager_proxy=\"${HTTPS_PROXY:-}\"; fi\n"
+        << "if [ -z \"$manager_proxy\" ]; then manager_proxy=\"${HTTP_PROXY:-}\"; fi\n"
+        << "if [ -z \"$manager_proxy\" ]; then manager_proxy=\"${https_proxy:-}\"; fi\n"
+        << "if [ -z \"$manager_proxy\" ]; then manager_proxy=\"${http_proxy:-}\"; fi\n"
+        << "if [ -z \"$manager_proxy\" ] && command -v nc >/dev/null 2>&1 && nc -z -G 1 127.0.0.1 18001 >/dev/null 2>&1; then manager_proxy='http://127.0.0.1:18001'; fi\n"
+        << "case \"$manager_proxy\" in ''|*://*) ;; *) manager_proxy=\"http://$manager_proxy\" ;; esac\n"
+        << "if [ -n \"$manager_proxy\" ]; then\n"
+        << "  if [ \"$force_manager_proxy\" = 1 ] || [ -z \"${HTTP_PROXY:-}\" ]; then export HTTP_PROXY=\"$manager_proxy\"; fi\n"
+        << "  if [ \"$force_manager_proxy\" = 1 ] || [ -z \"${HTTPS_PROXY:-}\" ]; then export HTTPS_PROXY=\"$manager_proxy\"; fi\n"
+        << "  if [ \"$force_manager_proxy\" = 1 ] || [ -z \"${http_proxy:-}\" ]; then export http_proxy=\"$manager_proxy\"; fi\n"
+        << "  if [ \"$force_manager_proxy\" = 1 ] || [ -z \"${https_proxy:-}\" ]; then export https_proxy=\"$manager_proxy\"; fi\n"
+        << "fi\n"
+        << "if [ -z \"${NO_PROXY:-}\" ]; then export NO_PROXY='localhost,127.0.0.1,::1'; fi\n"
+        << "if [ -z \"${no_proxy:-}\" ]; then export no_proxy=\"$NO_PROXY\"; fi\n";
+    return script.str();
+}
+
 std::string sh_quote(const std::string& s) {
     return "'" + replace_all(s, "'", "'\\''") + "'";
 }
@@ -1726,6 +1844,7 @@ void spawn_terminal(const Config& cfg, const fs::path& cwd, const std::string& c
            << "$env:PYTHONUTF8 = '1'\n"
            << "$env:PYTHONIOENCODING = 'utf-8'\n"
            << "try { chcp.com 65001 > $null } catch {}\n"
+           << powershell_proxy_prelude(cfg)
            << "Set-Location -LiteralPath " << ps_quote(path_string(cwd)) << "\n"
            << "try {\n"
            << command << "\n"
@@ -1739,7 +1858,7 @@ void spawn_terminal(const Config& cfg, const fs::path& cwd, const std::string& c
            << "Write-Host \"Process ended. Press Enter to close this window...\"\n"
            << "[void](Read-Host)\n";
     if (!write_text_file(script_path, script.str())) throw std::runtime_error("failed to write launch script");
-    const auto params = "-NoProfile -ExecutionPolicy Bypass -File " + win_arg_quote(path_string(script_path));
+    const auto params = "-ExecutionPolicy Bypass -File " + win_arg_quote(path_string(script_path));
     auto rc = reinterpret_cast<std::intptr_t>(ShellExecuteA(nullptr, "open", "powershell.exe", params.c_str(), nullptr, SW_SHOWNORMAL));
     if (rc <= 32) throw std::runtime_error("failed to launch PowerShell");
 #elif __APPLE__
@@ -1748,6 +1867,7 @@ void spawn_terminal(const Config& cfg, const fs::path& cwd, const std::string& c
     std::ostringstream script;
     script << "#!/bin/zsh\n"
            << "export PATH=\"" << shell_path_prefix() << ":$PATH\"\n"
+           << shell_proxy_prelude(cfg)
            << "cd " << sh_quote(path_string(cwd)) << " || exit $?\n"
            << command << "\n";
     if (!write_text_file(script_path, script.str())) throw std::runtime_error("failed to write launch script");
@@ -1759,7 +1879,11 @@ void spawn_terminal(const Config& cfg, const fs::path& cwd, const std::string& c
     const auto cmd = "/usr/bin/open -a Terminal " + sh_quote(path_string(script_path));
     if (std::system(cmd.c_str()) != 0) throw std::runtime_error("failed to launch Terminal");
 #else
-    const auto shell = "export PATH=\"" + shell_path_prefix() + ":$PATH\"; cd " + sh_quote(path_string(cwd)) + " && " + command + "; exec bash";
+    const auto shell =
+        "export PATH=\"" + shell_path_prefix() + ":$PATH\"\n" +
+        shell_proxy_prelude(cfg) +
+        "cd " + sh_quote(path_string(cwd)) + " && " + command + "\n"
+        "exec bash\n";
     const auto cmd = "x-terminal-emulator -e bash -lc " + sh_quote(shell) + " >/dev/null 2>&1 &";
     if (std::system(cmd.c_str()) != 0) throw std::runtime_error("failed to launch terminal");
 #endif
@@ -1906,6 +2030,7 @@ Config make_config(int argc, char** argv) {
     cfg.claude_projects = env_path("CLAUDE_HOME", cfg.home / ".claude") / "projects";
     cfg.index_file = cfg.is_codex ? cfg.home / ".codex_conv_manager_cpp" / "index.json"
                                   : cfg.home / ".claude_manager_cpp" / "index.json";
+    cfg.settings_file = cfg.index_file.parent_path() / "settings.json";
     if (const char* p = std::getenv(cfg.is_codex ? "CODEX_MANAGER_CPP_PORT" : "CLAUDE_MANAGER_CPP_PORT"); p && *p) {
         cfg.port = std::atoi(p);
     } else if (const char* p2 = std::getenv(cfg.is_codex ? "CODEX_MANAGER_PORT" : "CLAUDE_MANAGER_PORT"); p2 && *p2) {
@@ -2116,6 +2241,19 @@ void register_routes(httplib::Server& svr, const Config& cfg) {
 
     svr.Get("/api/auth-status", [&](const httplib::Request&, httplib::Response& res) {
         json_response(res, auth_status(cfg));
+    });
+
+    svr.Get("/api/settings", [&](const httplib::Request&, httplib::Response& res) {
+        json_response(res, {{"ok", true}, {"settings", load_manager_settings(cfg)}});
+    });
+
+    svr.Post("/api/settings", [&](const httplib::Request& req, httplib::Response& res) {
+        const auto data = parse_json_body(req);
+        const auto incoming = data.contains("settings") && data["settings"].is_object() ? data["settings"] : data;
+        json settings = load_manager_settings(cfg);
+        if (incoming.contains("proxyUrl")) settings["proxyUrl"] = field_string(incoming, "proxyUrl");
+        save_manager_settings(cfg, settings);
+        json_response(res, {{"ok", true}, {"settings", load_manager_settings(cfg)}});
     });
 
     svr.Post("/api/new-chat", [&](const httplib::Request&, httplib::Response& res) {
