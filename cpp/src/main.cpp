@@ -1531,6 +1531,10 @@ std::string ps_quote(const std::string& s) {
     return "'" + replace_all(s, "'", "''") + "'";
 }
 
+std::string win_arg_quote(const std::string& s) {
+    return "\"" + replace_all(s, "\"", "\\\"") + "\"";
+}
+
 std::string sh_quote(const std::string& s) {
     return "'" + replace_all(s, "'", "'\\''") + "'";
 }
@@ -1723,9 +1727,19 @@ void spawn_terminal(const Config& cfg, const fs::path& cwd, const std::string& c
            << "$env:PYTHONIOENCODING = 'utf-8'\n"
            << "try { chcp.com 65001 > $null } catch {}\n"
            << "Set-Location -LiteralPath " << ps_quote(path_string(cwd)) << "\n"
-           << command << "\n";
+           << "try {\n"
+           << command << "\n"
+           << "  $exitCode = $LASTEXITCODE\n"
+           << "  if ($null -ne $exitCode -and $exitCode -ne 0) { Write-Host \"`nProcess exited with code $exitCode\" -ForegroundColor Yellow }\n"
+           << "} catch {\n"
+           << "  Write-Host \"`nLauncher error:\" -ForegroundColor Red\n"
+           << "  Write-Host $_ -ForegroundColor Red\n"
+           << "}\n"
+           << "Write-Host \"\"\n"
+           << "Write-Host \"Process ended. Press Enter to close this window...\"\n"
+           << "[void](Read-Host)\n";
     if (!write_text_file(script_path, script.str())) throw std::runtime_error("failed to write launch script");
-    const auto params = "-NoExit -ExecutionPolicy Bypass -File " + ps_quote(path_string(script_path));
+    const auto params = "-NoProfile -ExecutionPolicy Bypass -File " + win_arg_quote(path_string(script_path));
     auto rc = reinterpret_cast<std::intptr_t>(ShellExecuteA(nullptr, "open", "powershell.exe", params.c_str(), nullptr, SW_SHOWNORMAL));
     if (rc <= 32) throw std::runtime_error("failed to launch PowerShell");
 #elif __APPLE__
@@ -1843,6 +1857,11 @@ json auth_status(const Config& cfg) {
 }
 
 void launch_new_chat(const Config& cfg) {
+    const auto cli_name = cfg.is_codex ? "codex" : "claude";
+    if (auto cli = find_cli(cfg, cli_name)) {
+        spawn_terminal(cfg, cfg.home, cli_command(*cli), cfg.is_codex ? "Codex" : "Claude");
+        return;
+    }
     if (auto sidecar = sidecar_exe(cfg)) {
 #ifdef _WIN32
         auto rc = reinterpret_cast<std::intptr_t>(ShellExecuteA(nullptr, "open", path_string(*sidecar).c_str(), nullptr, path_string(sidecar->parent_path()).c_str(), SW_SHOWNORMAL));
@@ -1850,10 +1869,7 @@ void launch_new_chat(const Config& cfg) {
         return;
 #endif
     }
-    const auto cli_name = cfg.is_codex ? "codex" : "claude";
-    auto cli = find_cli(cfg, cli_name);
-    if (!cli) throw std::runtime_error(cli_name + std::string(" CLI not found"));
-    spawn_terminal(cfg, cfg.home, cli_command(*cli), cfg.is_codex ? "Codex" : "Claude");
+    throw std::runtime_error(cli_name + std::string(" CLI not found"));
 }
 
 void launch_login(const Config& cfg, const std::string& cli_name) {
@@ -2132,11 +2148,11 @@ void register_routes(httplib::Server& svr, const Config& cfg) {
         try {
             if (cfg.is_codex) {
                 *c = restore_codex_session_if_needed(cfg, *c);
-                auto codex = find_cli(cfg, "codex", true);
+                auto codex = find_cli(cfg, "codex");
                 if (!codex) throw std::runtime_error("codex CLI not found");
                 spawn_terminal(cfg, fs::path(cwd), cli_command(*codex, {"resume", c->sid}), "Codex Resume");
             } else {
-                auto claude = find_cli(cfg, "claude", true);
+                auto claude = find_cli(cfg, "claude");
                 if (!claude) throw std::runtime_error("claude CLI not found");
                 const auto command = cli_command(*claude, {
                     "--permission-mode", "bypassPermissions",
@@ -2168,7 +2184,7 @@ void register_routes(httplib::Server& svr, const Config& cfg) {
             return;
         }
         try {
-            auto claude = find_cli(cfg, "claude", true);
+            auto claude = find_cli(cfg, "claude");
             if (!claude) throw std::runtime_error("claude CLI not found");
             const auto prompt = "This is context imported from a local Codex session. Continue the user's work in Claude Code.\n\n" +
                 session_markdown(cfg, *c);
@@ -2205,7 +2221,7 @@ void register_routes(httplib::Server& svr, const Config& cfg) {
             return;
         }
         try {
-            auto codex = find_cli(cfg, "codex", true);
+            auto codex = find_cli(cfg, "codex");
             if (!codex) throw std::runtime_error("codex CLI not found");
             const auto md_path = fs::path(cwd) / ("_claude_manager_" + c->sid + ".md");
             if (!write_text_file(md_path, session_markdown(cfg, *c))) throw std::runtime_error("failed to write transfer markdown");
