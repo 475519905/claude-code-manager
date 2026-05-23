@@ -22,4 +22,17 @@ cmake --build build
 if errorlevel 1 exit /b %errorlevel%
 echo.
 echo Built: %CD%\build\conv_manager_cpp.exe
+set "APP_NAME=ClaudeManager"
+set "SIDECAR_NAME=Claude.exe"
+set "PACKAGE_DIR=%CD%\..\dist\cpp\%APP_NAME%"
+if not exist "%PACKAGE_DIR%" mkdir "%PACKAGE_DIR%"
+copy /Y "build\conv_manager_cpp.exe" "%PACKAGE_DIR%\%APP_NAME%.exe" >nul
+if exist "%PACKAGE_DIR%\web" rmdir /S /Q "%PACKAGE_DIR%\web"
+xcopy /E /I /Y "%CD%\..\web" "%PACKAGE_DIR%\web" >nul
+if exist "%CD%\..\%SIDECAR_NAME%" (
+  copy /Y "%CD%\..\%SIDECAR_NAME%" "%PACKAGE_DIR%\%SIDECAR_NAME%" >nul
+) else if exist "%CD%\..\..\%SIDECAR_NAME%" (
+  copy /Y "%CD%\..\..\%SIDECAR_NAME%" "%PACKAGE_DIR%\%SIDECAR_NAME%" >nul
+)
+echo Packaged: %PACKAGE_DIR%
 popd

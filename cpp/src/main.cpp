@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cmath>
 #include <cctype>
+#include <cstdio>
 #include <cstdlib>
 #include <ctime>
 #include <filesystem>
@@ -1489,6 +1490,18 @@ std::string ps_quote(const std::string& s) {
     return "'" + replace_all(s, "'", "''") + "'";
 }
 
+std::string sh_quote(const std::string& s) {
+    return "'" + replace_all(s, "'", "'\\''") + "'";
+}
+
+std::string shell_path_prefix() {
+#ifdef __APPLE__
+    return "/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/Library/pnpm:$HOME/.bun/bin:$HOME/.cargo/bin";
+#else
+    return "$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/.bun/bin:$HOME/.cargo/bin";
+#endif
+}
+
 std::vector<fs::path> path_dirs() {
     std::vector<fs::path> out;
     std::set<std::string> seen;
@@ -1516,9 +1529,30 @@ std::vector<fs::path> path_dirs() {
         if (ec) key = path_string(p);
         if (seen.insert(lower_ascii(key)).second) out.push_back(p);
     };
+    add("/opt/homebrew/bin");
+    add("/usr/local/bin");
+    add("/usr/bin");
+    add("/bin");
+    add("/usr/sbin");
+    add("/sbin");
     add(home_dir() / ".local" / "bin");
+    add(home_dir() / ".npm-global" / "bin");
+    add(home_dir() / "Library" / "pnpm");
+    add(home_dir() / ".bun" / "bin");
     add(home_dir() / ".cargo" / "bin");
+    add(home_dir() / ".volta" / "bin");
+    add(home_dir() / ".asdf" / "shims");
+    add(home_dir() / ".nodenv" / "shims");
+    const auto nvm_versions = home_dir() / ".nvm" / "versions" / "node";
+    if (fs::is_directory(nvm_versions)) {
+        for (const auto& entry : fs::directory_iterator(nvm_versions)) {
+            std::error_code type_ec;
+            if (entry.is_directory(type_ec)) add(entry.path() / "bin");
+        }
+    }
+#ifdef _WIN32
     add(home_dir() / "AppData" / "Roaming" / "npm");
+#endif
     return out;
 }
 
@@ -1532,16 +1566,47 @@ std::optional<fs::path> find_cli(const Config& cfg, const std::string& name) {
     auto sidecar = cfg.exe_dir / (name == "codex" ? "Codex.exe" : "Claude.exe");
     std::error_code ec;
     auto sidecar_key = lower_ascii(path_string(fs::weakly_canonical(sidecar, ec)));
+    auto try_path = [&](const fs::path& p) -> std::optional<fs::path> {
+        if (!fs::is_regular_file(p)) return std::nullopt;
+        std::error_code pc_ec;
+        auto p_key = lower_ascii(path_string(fs::weakly_canonical(p, pc_ec)));
+        if (!sidecar_key.empty() && p_key == sidecar_key) return std::nullopt;
+        return p;
+    };
+#ifdef __APPLE__
+    std::vector<fs::path> app_candidates;
+    if (name == "codex") {
+        app_candidates.push_back("/Applications/Codex.app/Contents/Resources/codex");
+        app_candidates.push_back(cfg.home / "Applications" / "Codex.app" / "Contents" / "Resources" / "codex");
+    } else if (name == "claude") {
+        app_candidates.push_back(cfg.home / ".claude" / "local" / "claude");
+        app_candidates.push_back("/Applications/Claude Code.app/Contents/Resources/claude");
+        app_candidates.push_back("/Applications/Claude.app/Contents/Resources/claude");
+        app_candidates.push_back(cfg.home / "Applications" / "Claude Code.app" / "Contents" / "Resources" / "claude");
+        app_candidates.push_back(cfg.home / "Applications" / "Claude.app" / "Contents" / "Resources" / "claude");
+    }
+    for (const auto& p : app_candidates) {
+        if (auto found = try_path(p)) return found;
+    }
+#endif
     for (const auto& dir : path_dirs()) {
         for (const auto& candidate : names) {
             auto p = dir / candidate;
-            if (!fs::is_regular_file(p)) continue;
-            std::error_code pc_ec;
-            auto p_key = lower_ascii(path_string(fs::weakly_canonical(p, pc_ec)));
-            if (!sidecar_key.empty() && p_key == sidecar_key) continue;
-            return p;
+            if (auto found = try_path(p)) return found;
         }
     }
+#ifndef _WIN32
+    const auto probe = "/bin/zsh -lc " + sh_quote("command -v " + sh_quote(name) + " 2>/dev/null");
+    if (FILE* pipe = popen(probe.c_str(), "r")) {
+        char buffer[4096] = {};
+        std::string line;
+        if (std::fgets(buffer, sizeof(buffer), pipe)) line = trim(buffer);
+        pclose(pipe);
+        if (!line.empty()) {
+            if (auto found = try_path(fs::path(line))) return found;
+        }
+    }
+#endif
     return std::nullopt;
 }
 
@@ -1601,13 +1666,55 @@ void spawn_terminal(const Config& cfg, const fs::path& cwd, const std::string& c
     auto rc = reinterpret_cast<std::intptr_t>(ShellExecuteA(nullptr, "open", "powershell.exe", params.c_str(), nullptr, SW_SHOWNORMAL));
     if (rc <= 32) throw std::runtime_error("failed to launch PowerShell");
 #elif __APPLE__
-    const auto shell = "cd " + path_string(cwd) + " && " + command;
-    const auto escaped = replace_all(shell, "\"", "\\\"");
-    const auto cmd = "osascript -e \"tell application \\\"Terminal\\\" to do script \\\"" + escaped + "\\\"\"";
-    std::system(cmd.c_str());
+    const auto script_path = cfg.index_file.parent_path() /
+        ("launch-" + safe_slug(title, "terminal") + "-" + std::to_string(static_cast<long long>(now_seconds())) + ".command");
+    std::ostringstream script;
+    script << "#!/bin/zsh\n"
+           << "export PATH=\"" << shell_path_prefix() << ":$PATH\"\n"
+           << "cd " << sh_quote(path_string(cwd)) << " || exit $?\n"
+           << command << "\n";
+    if (!write_text_file(script_path, script.str())) throw std::runtime_error("failed to write launch script");
+    std::error_code perm_ec;
+    fs::permissions(script_path,
+                    fs::perms::owner_exec | fs::perms::group_exec | fs::perms::others_exec,
+                    fs::perm_options::add,
+                    perm_ec);
+    const auto cmd = "/usr/bin/open -a Terminal " + sh_quote(path_string(script_path));
+    if (std::system(cmd.c_str()) != 0) throw std::runtime_error("failed to launch Terminal");
 #else
-    const auto cmd = "x-terminal-emulator -e bash -lc 'cd \"" + path_string(cwd) + "\" && " + command + "; exec bash' >/dev/null 2>&1 &";
-    std::system(cmd.c_str());
+    const auto shell = "export PATH=\"" + shell_path_prefix() + ":$PATH\"; cd " + sh_quote(path_string(cwd)) + " && " + command + "; exec bash";
+    const auto cmd = "x-terminal-emulator -e bash -lc " + sh_quote(shell) + " >/dev/null 2>&1 &";
+    if (std::system(cmd.c_str()) != 0) throw std::runtime_error("failed to launch terminal");
+#endif
+}
+
+std::string cli_command(const fs::path& cli, const std::vector<std::string>& args = {}) {
+#ifdef _WIN32
+    std::string out = "& " + ps_quote(path_string(cli));
+    for (const auto& arg : args) out += " " + ps_quote(arg);
+    return out;
+#else
+    std::string out = sh_quote(path_string(cli));
+    for (const auto& arg : args) out += " " + sh_quote(arg);
+    return out;
+#endif
+}
+
+std::string prompt_file_prelude(const fs::path& path) {
+#ifdef _WIN32
+    return "$prompt = Get-Content -LiteralPath " + ps_quote(path_string(path)) + " -Raw -Encoding UTF8\n";
+#else
+    (void)path;
+    return "";
+#endif
+}
+
+std::string prompt_file_arg(const fs::path& path) {
+#ifdef _WIN32
+    (void)path;
+    return "$prompt";
+#else
+    return "\"$(cat " + sh_quote(path_string(path)) + ")\"";
 #endif
 }
 
@@ -1647,14 +1754,14 @@ void launch_new_chat(const Config& cfg) {
     const auto cli_name = cfg.is_codex ? "codex" : "claude";
     auto cli = find_cli(cfg, cli_name);
     if (!cli) throw std::runtime_error(cli_name + std::string(" CLI not found"));
-    spawn_terminal(cfg, cfg.home, "& " + ps_quote(path_string(*cli)), cfg.is_codex ? "Codex" : "Claude");
+    spawn_terminal(cfg, cfg.home, cli_command(*cli), cfg.is_codex ? "Codex" : "Claude");
 }
 
 void launch_login(const Config& cfg, const std::string& cli_name) {
     auto cli = find_cli(cfg, cli_name);
     if (!cli) throw std::runtime_error(cli_name + std::string(" CLI not found"));
     const auto arg = cli_name == "claude" ? "/login" : "login";
-    spawn_terminal(cfg, cfg.home, "& " + ps_quote(path_string(*cli)) + " " + arg, cli_name == "claude" ? "Claude Login" : "Codex Login");
+    spawn_terminal(cfg, cfg.home, cli_command(*cli, {arg}), cli_name == "claude" ? "Claude Login" : "Codex Login");
 }
 
 json account_payload(const Config& cfg) {
@@ -1923,12 +2030,15 @@ void register_routes(httplib::Server& svr, const Config& cfg) {
             if (cfg.is_codex) {
                 auto codex = find_cli(cfg, "codex");
                 if (!codex) throw std::runtime_error("codex CLI not found");
-                spawn_terminal(cfg, fs::path(cwd), "& " + ps_quote(path_string(*codex)) + " resume " + ps_quote(c->sid), "Codex Resume");
+                spawn_terminal(cfg, fs::path(cwd), cli_command(*codex, {"resume", c->sid}), "Codex Resume");
             } else {
                 auto claude = find_cli(cfg, "claude");
                 if (!claude) throw std::runtime_error("claude CLI not found");
-                const auto command = "& " + ps_quote(path_string(*claude)) +
-                    " --permission-mode bypassPermissions --dangerously-skip-permissions --resume " + ps_quote(c->sid);
+                const auto command = cli_command(*claude, {
+                    "--permission-mode", "bypassPermissions",
+                    "--dangerously-skip-permissions",
+                    "--resume", c->sid
+                });
                 spawn_terminal(cfg, fs::path(cwd), command, "Claude Resume");
             }
             json_response(res, {{"ok", true}, {"cwd", cwd}});
@@ -1959,10 +2069,13 @@ void register_routes(httplib::Server& svr, const Config& cfg) {
             const auto prompt = "This is context imported from a local Codex session. Continue the user's work in Claude Code.\n\n" +
                 session_markdown(cfg, *c);
             const auto prompt_path = write_transfer_file(cfg, "codex-to-claude", c->sid, prompt);
-            const auto command =
-                "$prompt = Get-Content -LiteralPath " + ps_quote(path_string(prompt_path)) + " -Raw -Encoding UTF8\n"
-                "& " + ps_quote(path_string(*claude)) + " --add-dir " + ps_quote(path_string(prompt_path.parent_path())) +
-                " --permission-mode bypassPermissions --dangerously-skip-permissions -- $prompt";
+            const auto command = prompt_file_prelude(prompt_path) +
+                cli_command(*claude, {
+                    "--add-dir", path_string(prompt_path.parent_path()),
+                    "--permission-mode", "bypassPermissions",
+                    "--dangerously-skip-permissions",
+                    "--"
+                }) + " " + prompt_file_arg(prompt_path);
             spawn_terminal(cfg, fs::path(cwd), command, "Claude");
             json_response(res, {{"ok", true}, {"cwd", cwd}, {"promptPath", path_string(prompt_path)}});
         } catch (const std::exception& e) {
@@ -1992,7 +2105,7 @@ void register_routes(httplib::Server& svr, const Config& cfg) {
             const auto md_path = fs::path(cwd) / ("_claude_manager_" + c->sid + ".md");
             if (!write_text_file(md_path, session_markdown(cfg, *c))) throw std::runtime_error("failed to write transfer markdown");
             const auto prompt = "Reference " + md_path.filename().string() + " in the current directory and continue the task.";
-            spawn_terminal(cfg, fs::path(cwd), "& " + ps_quote(path_string(*codex)) + " " + ps_quote(prompt), "Codex");
+            spawn_terminal(cfg, fs::path(cwd), cli_command(*codex, {prompt}), "Codex");
             json_response(res, {{"ok", true}, {"cwd", cwd}, {"mdPath", path_string(md_path)}});
         } catch (const std::exception& e) {
             error_response(res, 500, e.what());
