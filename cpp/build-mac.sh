@@ -23,6 +23,9 @@ ditto "${APP_SRC}" "${APP_DST}"
 rm -rf "${APP_DST}/Contents/Resources/web"
 mkdir -p "${APP_DST}/Contents/Resources"
 ditto "${ROOT}/../web" "${APP_DST}/Contents/Resources/web"
+if [[ -f "${ROOT}/../icon-512.png" ]]; then
+  cp "${ROOT}/../icon-512.png" "${APP_DST}/Contents/Resources/icon-512.png"
+fi
 
 rm -f "${ZIP_PATH}"
 (cd "${PACKAGE_DIR}" && ditto -c -k --sequesterRsrc --keepParent "${APP_NAME}.app" "${ZIP_PATH}")
