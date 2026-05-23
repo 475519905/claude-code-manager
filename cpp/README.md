@@ -10,14 +10,21 @@ Build on Windows:
 build.bat
 ```
 
+Build on macOS:
+
+```bash
+./build-mac.sh
+```
+
 Run:
 
 ```bat
 build\conv_manager_cpp.exe
 ```
 
-On Windows the default UI is a standalone WebView2 desktop window. It starts at
-2560x1440 and uses the local C++ HTTP server internally.
+On Windows the default UI is a standalone WebView2 desktop window. On macOS it
+uses a Cocoa WKWebView desktop window. The default window starts at 2560x1440
+and uses the local C++ HTTP server internally.
 
 Useful options:
 
