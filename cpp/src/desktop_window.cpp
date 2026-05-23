@@ -18,10 +18,23 @@ using Microsoft::WRL::Callback;
 using Microsoft::WRL::ComPtr;
 
 constexpr wchar_t kWindowClass[] = L"ConvManagerCppWebViewWindow";
+constexpr int kAppIconResourceId = 101;
 
 ComPtr<ICoreWebView2Controller> g_controller;
 ComPtr<ICoreWebView2> g_webview;
 std::wstring g_initial_url;
+
+HICON load_app_icon(HINSTANCE instance, int width, int height) {
+    auto icon = reinterpret_cast<HICON>(LoadImageW(
+        instance,
+        MAKEINTRESOURCEW(kAppIconResourceId),
+        IMAGE_ICON,
+        width,
+        height,
+        LR_DEFAULTCOLOR));
+    if (icon) return icon;
+    return LoadIconW(nullptr, MAKEINTRESOURCEW(32512));
+}
 
 std::wstring utf8_to_wide(const std::string& value) {
     if (value.empty()) return {};
@@ -172,8 +185,8 @@ int run_desktop_window(
     wc.lpfnWndProc = window_proc;
     wc.hInstance = GetModuleHandleW(nullptr);
     wc.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512));
-    wc.hIcon = LoadIconW(nullptr, MAKEINTRESOURCEW(32512));
-    wc.hIconSm = wc.hIcon;
+    wc.hIcon = load_app_icon(wc.hInstance, GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON));
+    wc.hIconSm = load_app_icon(wc.hInstance, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON));
     wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
     wc.lpszClassName = kWindowClass;
     RegisterClassExW(&wc);
@@ -204,6 +217,9 @@ int run_desktop_window(
         OleUninitialize();
         return 1;
     }
+
+    SendMessageW(hwnd, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(wc.hIcon));
+    SendMessageW(hwnd, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(wc.hIconSm));
 
     ShowWindow(hwnd, SW_SHOW);
     UpdateWindow(hwnd);
