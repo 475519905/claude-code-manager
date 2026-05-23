@@ -39,9 +39,19 @@ set(CONV_MANAGER_SOURCES
   src/desktop_window.cpp
 )
 
+if(WIN32)
+  enable_language(RC)
+  set(APP_ICON_ICO "${CMAKE_CURRENT_LIST_DIR}/../icon.ico")
+  string(REPLACE "\\" "/" APP_ICON_ICO_RC "${APP_ICON_ICO}")
+  configure_file(src/app_icon.rc.in "${CMAKE_CURRENT_BINARY_DIR}/app_icon.rc" @ONLY)
+  list(APPEND CONV_MANAGER_SOURCES "${CMAKE_CURRENT_BINARY_DIR}/app_icon.rc")
+endif()
+
 if(APPLE)
   enable_language(OBJCXX)
-  list(APPEND CONV_MANAGER_SOURCES src/desktop_window_mac.mm)
+  set(APP_ICON_ICNS "${CMAKE_CURRENT_LIST_DIR}/../icon.icns")
+  list(APPEND CONV_MANAGER_SOURCES src/desktop_window_mac.mm "${APP_ICON_ICNS}")
+  set_source_files_properties("${APP_ICON_ICNS}" PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
 endif()
 
 add_executable(conv_manager_cpp ${CONV_MANAGER_SOURCES})
@@ -86,8 +96,9 @@ if(APPLE)
   )
   set_target_properties(conv_manager_cpp PROPERTIES
     MACOSX_BUNDLE TRUE
+    MACOSX_BUNDLE_ICON_FILE "icon.icns"
     MACOSX_BUNDLE_GUI_IDENTIFIER "local.claude.manager.cpp"
-    MACOSX_BUNDLE_BUNDLE_NAME "Claude Manager C++"
+    MACOSX_BUNDLE_BUNDLE_NAME "Claude Manager"
   )
 endif()
 

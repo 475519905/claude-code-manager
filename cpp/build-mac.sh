@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-APP_NAME="ClaudeManagerCpp"
+APP_NAME="ClaudeManager"
 MANAGER_KIND="${MANAGER_KIND:-claude}"
 ARCH="${ARCH:-$(uname -m)}"
 BUILD_DIR="${ROOT}/build-mac"

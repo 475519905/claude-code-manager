@@ -57,7 +57,7 @@ enum class UiMode {
 struct Config {
     std::string kind = CONV_MANAGER_KIND;
     bool is_codex = kind == "codex";
-    std::string app_name = is_codex ? "Codex Manager C++" : "Claude Manager C++";
+    std::string app_name = is_codex ? "Codex Manager" : "Claude Manager";
     std::string host = "127.0.0.1";
     int port = is_codex ? 8766 : 8765;
 #if defined(_WIN32) || defined(__APPLE__)
@@ -1627,24 +1627,13 @@ json read_json_file(const fs::path& path) {
 }
 
 json auth_status(const Config& cfg) {
-    if (cfg.is_codex) {
-        auto auth = read_json_file(cfg.codex_home / "auth.json");
-        const auto tokens = field_object(auth, "tokens");
-        const bool ok = !field_string(auth, "OPENAI_API_KEY").empty() ||
-                        !field_string(tokens, "refresh_token").empty() ||
-                        !field_string(tokens, "access_token").empty();
-        return ok ? json{{"ok", true}, {"reason", "ok"}, {"expiresInSec", nullptr}}
-                  : json{{"ok", false}, {"reason", "no_credentials"}, {"expiresInSec", nullptr}};
-    }
-    auto cred = read_json_file(cfg.home / ".claude" / ".credentials.json");
-    auto oauth = field_object(cred, "claudeAiOauth");
-    if (oauth.empty()) return {{"ok", false}, {"reason", "no_credentials"}, {"expiresInSec", nullptr}};
-    const auto expires_ms = field_int(oauth, "expiresAt");
-    if (!expires_ms) return {{"ok", false}, {"reason", "no_expires"}, {"expiresInSec", nullptr}};
-    const auto remaining = static_cast<long long>(expires_ms / 1000 - now_seconds());
-    if (remaining <= 0) return {{"ok", false}, {"reason", "expired"}, {"expiresInSec", remaining}};
-    if (remaining < 120) return {{"ok", false}, {"reason", "expiring"}, {"expiresInSec", remaining}};
-    return {{"ok", true}, {"reason", "ok"}, {"expiresInSec", remaining}};
+    (void)cfg;
+    return {
+        {"ok", true},
+        {"reason", "privacy_disabled"},
+        {"expiresInSec", nullptr},
+        {"privacyMode", true}
+    };
 }
 
 void launch_new_chat(const Config& cfg) {
@@ -1673,16 +1662,12 @@ json account_payload(const Config& cfg) {
     if (cfg.is_codex) {
         return {{"name", "Codex"}, {"email", "local Codex"}, {"auth", auth}};
     }
-    auto cred = read_json_file(cfg.home / ".claude" / ".credentials.json");
-    auto oauth = field_object(cred, "claudeAiOauth");
-    auto sub = field_string(oauth, "subscriptionType");
-    auto tier = field_string(oauth, "rateLimitTier");
     return {
         {"ok", true},
         {"name", "Claude"},
         {"email", "local Claude"},
-        {"plan", sub.empty() ? "-" : sub},
-        {"tier", tier},
+        {"plan", "-"},
+        {"tier", ""},
         {"auth", auth}
     };
 }
@@ -1917,7 +1902,7 @@ void register_routes(httplib::Server& svr, const Config& cfg) {
     });
 
     auto login_stub = [](const httplib::Request&, httplib::Response& res) {
-        json_response(res, {{"ok", false}, {"error", "login is intentionally disabled in the C++ client"}}, 501);
+        json_response(res, {{"ok", false}, {"error", "login is intentionally disabled in the desktop client"}}, 501);
     };
     svr.Post("/api/codex-login", login_stub);
     svr.Post("/api/claude-login", login_stub);
