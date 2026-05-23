@@ -1,0 +1,7 @@
+Flask>=3.0,<4
+pyinstaller>=6.0,<7
+pywebview>=6.0,<7
+pyobjc-core>=10; platform_system == "Darwin"
+pyobjc-framework-Cocoa>=10; platform_system == "Darwin"
+pyobjc-framework-Quartz>=10; platform_system == "Darwin"
+pyobjc-framework-WebKit>=10; platform_system == "Darwin"
