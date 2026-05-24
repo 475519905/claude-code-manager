@@ -11,6 +11,7 @@
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
@@ -24,6 +25,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -96,9 +98,12 @@ struct SearchEntry {
     struct Record {
         std::string role;
         std::string text;
-        std::string lower;
         std::string ts;
     };
+    std::mutex mutex;
+    bool loaded = false;
+    bool loading = false;
+    std::vector<Record> records;
     std::unordered_map<std::string, json> hit_cache;
 };
 
@@ -109,8 +114,12 @@ struct DetailEntry {
 };
 
 std::mutex g_index_mutex;
+std::mutex g_candidate_mutex;
 std::mutex g_search_mutex;
 std::mutex g_detail_mutex;
+std::string g_candidate_cache_key;
+std::vector<Candidate> g_candidate_cache;
+std::atomic_bool g_search_warmup_running{false};
 std::unordered_map<std::string, std::shared_ptr<SearchEntry>> g_search_blobs;
 std::unordered_map<std::string, DetailEntry> g_detail_cache;
 std::optional<json> g_index_cache;
@@ -195,6 +204,40 @@ std::string lower_ascii(std::string s) {
         return static_cast<char>(std::tolower(c));
     });
     return s;
+}
+
+char lower_ascii_char(char c) {
+    const auto uc = static_cast<unsigned char>(c);
+    return uc < 128 ? static_cast<char>(std::tolower(uc)) : c;
+}
+
+size_t find_ascii_case_insensitive(std::string_view haystack, std::string_view needle_lower) {
+    if (needle_lower.empty()) return 0;
+    if (haystack.size() < needle_lower.size()) return std::string_view::npos;
+    const auto* data = haystack.data();
+    const auto first = static_cast<unsigned char>(needle_lower.front());
+    const auto first_alt = first >= 'a' && first <= 'z' ? static_cast<unsigned char>(std::toupper(first)) : first;
+    const auto last = haystack.size() - needle_lower.size();
+    size_t i = 0;
+    while (i <= last) {
+        const auto remaining = haystack.size() - i;
+        const auto* p1 = static_cast<const char*>(std::memchr(data + i, first, remaining));
+        const char* p = p1;
+        if (first_alt != first) {
+            const auto* p2 = static_cast<const char*>(std::memchr(data + i, first_alt, remaining));
+            if (!p || (p2 && p2 < p)) p = p2;
+        }
+        if (!p) return std::string_view::npos;
+        i = static_cast<size_t>(p - data);
+        if (i > last) return std::string_view::npos;
+        size_t j = 1;
+        for (; j < needle_lower.size(); ++j) {
+            if (lower_ascii_char(haystack[i + j]) != needle_lower[j]) break;
+        }
+        if (j == needle_lower.size()) return i;
+        ++i;
+    }
+    return std::string_view::npos;
 }
 
 bool utf8_continuation(unsigned char c) {
@@ -885,7 +928,31 @@ std::vector<Candidate> enumerate_codex_files(const Config& cfg) {
 }
 
 std::vector<Candidate> enumerate_files(const Config& cfg) {
-    return cfg.is_codex ? enumerate_codex_files(cfg) : enumerate_claude_files(cfg);
+    auto files = cfg.is_codex ? enumerate_codex_files(cfg) : enumerate_claude_files(cfg);
+    {
+        std::lock_guard<std::mutex> lock(g_candidate_mutex);
+        g_candidate_cache_key = path_string(cfg.index_file);
+        g_candidate_cache = files;
+    }
+    return files;
+}
+
+std::vector<Candidate> enumerate_files_cached(const Config& cfg) {
+    {
+        std::lock_guard<std::mutex> lock(g_candidate_mutex);
+        if (g_candidate_cache_key == path_string(cfg.index_file) && !g_candidate_cache.empty()) {
+            return g_candidate_cache;
+        }
+    }
+    return enumerate_files(cfg);
+}
+
+void clear_candidate_cache(const Config& cfg) {
+    std::lock_guard<std::mutex> lock(g_candidate_mutex);
+    if (g_candidate_cache_key == path_string(cfg.index_file)) {
+        g_candidate_cache_key.clear();
+        g_candidate_cache.clear();
+    }
 }
 
 std::optional<Candidate> find_session(const Config& cfg, std::string project, std::string sid) {
@@ -1003,9 +1070,7 @@ void add_search_record(const Config& cfg, const json& obj, std::vector<SearchEnt
         }
     }
     if (text.empty()) return;
-    auto lower = lower_ascii(text);
-    if (lower.empty()) return;
-    records.push_back({role, std::move(text), std::move(lower), field_string(obj, "timestamp")});
+    records.push_back({role, std::move(text), field_string(obj, "timestamp")});
 }
 
 std::shared_ptr<SearchEntry> ensure_search_entry(const Candidate& c) {
@@ -1027,6 +1092,59 @@ std::shared_ptr<SearchEntry> ensure_search_entry(const Candidate& c) {
     return entry;
 }
 
+std::vector<SearchEntry::Record> load_search_records_uncached(const Config& cfg, const Candidate& c) {
+    std::vector<SearchEntry::Record> records;
+    std::ifstream in(c.path, std::ios::binary);
+    if (!in) return records;
+    std::string line;
+    while (std::getline(in, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        auto obj = json::parse(line, nullptr, false);
+        if (obj.is_discarded()) continue;
+        add_search_record(cfg, obj, records);
+    }
+    return records;
+}
+
+void load_search_records(const Config& cfg, const Candidate& c, const std::shared_ptr<SearchEntry>& entry) {
+    if (!entry) return;
+    {
+        std::lock_guard<std::mutex> lock(entry->mutex);
+        if (entry->loaded || entry->loading || entry->mtime != c.mtime || entry->size != c.size) return;
+        entry->loading = true;
+    }
+
+    auto records = load_search_records_uncached(cfg, c);
+
+    {
+        std::lock_guard<std::mutex> lock(entry->mutex);
+        entry->records = std::move(records);
+        entry->loaded = true;
+        entry->loading = false;
+        entry->hit_cache.clear();
+    }
+}
+
+std::optional<json> search_loaded_records(const std::shared_ptr<SearchEntry>& entry, const std::string& query, const std::string& qlower) {
+    if (!entry) return std::nullopt;
+    std::lock_guard<std::mutex> lock(entry->mutex);
+    auto cache_it = entry->hit_cache.find(qlower);
+    if (cache_it != entry->hit_cache.end()) return cache_it->second;
+    if (!entry->loaded) return std::nullopt;
+
+    json hits = json::array();
+    for (const auto& record : entry->records) {
+        if (hits.size() >= 3) break;
+        const auto pos = find_ascii_case_insensitive(record.text, qlower);
+        if (pos == std::string_view::npos) continue;
+        const auto begin = pos > 40 ? pos - 40 : 0;
+        const auto end = std::min(record.text.size(), pos + query.size() + 80);
+        hits.push_back({{"role", record.role}, {"snippet", utf8_slice(record.text, begin, end)}, {"ts", record.ts}});
+    }
+    entry->hit_cache[qlower] = hits;
+    return hits;
+}
+
 json search_snippets_uncached(const Config& cfg, const Candidate& c, const std::string& query, const std::string& qlower) {
     json hits = json::array();
     std::ifstream in(c.path, std::ios::binary);
@@ -1034,15 +1152,15 @@ json search_snippets_uncached(const Config& cfg, const Candidate& c, const std::
     std::string line;
     while (hits.size() < 3 && std::getline(in, line)) {
         if (!line.empty() && line.back() == '\r') line.pop_back();
-        if (lower_ascii(line).find(qlower) == std::string::npos) continue;
+        if (find_ascii_case_insensitive(line, qlower) == std::string_view::npos) continue;
         auto obj = json::parse(line, nullptr, false);
         if (obj.is_discarded()) continue;
         std::vector<SearchEntry::Record> records;
         add_search_record(cfg, obj, records);
         for (const auto& record : records) {
             if (hits.size() >= 3) break;
-            const auto pos = record.lower.find(qlower);
-            if (pos == std::string::npos) continue;
+            const auto pos = find_ascii_case_insensitive(record.text, qlower);
+            if (pos == std::string_view::npos) continue;
             const auto begin = pos > 40 ? pos - 40 : 0;
             const auto end = std::min(record.text.size(), pos + query.size() + 80);
             hits.push_back({{"role", record.role}, {"snippet", utf8_slice(record.text, begin, end)}, {"ts", record.ts}});
@@ -1052,17 +1170,42 @@ json search_snippets_uncached(const Config& cfg, const Candidate& c, const std::
 }
 
 json search_snippets(const Config& cfg, const Candidate& c, std::shared_ptr<SearchEntry> entry, const std::string& query, const std::string& qlower) {
-    if (entry) {
-        std::lock_guard<std::mutex> lock(g_search_mutex);
-        auto it = entry->hit_cache.find(qlower);
-        if (it != entry->hit_cache.end()) return it->second;
-    }
+    if (auto loaded_hits = search_loaded_records(entry, query, qlower)) return *loaded_hits;
     auto hits = search_snippets_uncached(cfg, c, query, qlower);
     if (entry) {
-        std::lock_guard<std::mutex> lock(g_search_mutex);
+        std::lock_guard<std::mutex> lock(entry->mutex);
         entry->hit_cache[qlower] = hits;
     }
     return hits;
+}
+
+void start_search_warmup(const Config& cfg) {
+    bool expected = false;
+    if (!g_search_warmup_running.compare_exchange_strong(expected, true)) return;
+    std::thread([cfg] {
+        try {
+            const auto files = enumerate_files_cached(cfg);
+            if (!files.empty()) {
+                std::atomic_size_t next{0};
+                const auto workers = std::max<size_t>(1, std::min<size_t>(1, files.size()));
+                std::vector<std::thread> threads;
+                for (size_t w = 0; w < workers; ++w) {
+                    threads.emplace_back([&, w] {
+                        (void)w;
+                        while (true) {
+                            const auto i = next.fetch_add(1);
+                            if (i >= files.size()) break;
+                            auto entry = ensure_search_entry(files[i]);
+                            load_search_records(cfg, files[i], entry);
+                        }
+                    });
+                }
+                for (auto& thread : threads) thread.join();
+            }
+        } catch (...) {
+        }
+        g_search_warmup_running.store(false);
+    }).detach();
 }
 
 json build_session_detail_uncached(const Config& cfg, const Candidate& c) {
@@ -2089,6 +2232,7 @@ void register_routes(httplib::Server& svr, const Config& cfg) {
         try {
             auto [projects, sessions] = load_session_summaries(cfg);
             json_response(res, {{"projects", projects}, {"sessions", sessions}});
+            start_search_warmup(cfg);
         } catch (const std::exception& e) {
             error_response(res, 500, e.what());
         }
@@ -2099,6 +2243,7 @@ void register_routes(httplib::Server& svr, const Config& cfg) {
             std::lock_guard<std::mutex> lock(g_index_mutex);
             g_index_cache.reset();
         }
+        clear_candidate_cache(cfg);
         {
             std::lock_guard<std::mutex> lock(g_search_mutex);
             g_search_blobs.clear();
@@ -2120,13 +2265,13 @@ void register_routes(httplib::Server& svr, const Config& cfg) {
     });
 
     svr.Get("/api/search", [&](const httplib::Request& req, httplib::Response& res) {
-        const auto query = req.has_param("q") ? url_decode(req.get_param_value("q")) : "";
-        if (trim(query).empty()) {
+        const auto query = trim(req.has_param("q") ? url_decode(req.get_param_value("q")) : "");
+        if (query.empty()) {
             json_response(res, {{"results", json::array()}});
             return;
         }
         const auto qlower = lower_ascii(query);
-        const auto files = enumerate_files(cfg);
+        const auto files = enumerate_files_cached(cfg);
         json results = json::array();
         std::vector<json> result_items(files.size());
         std::atomic_size_t next{0};

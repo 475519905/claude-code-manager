@@ -130,6 +130,8 @@
       title,
       originalTitle: generatedTitle,
       snippet,
+      searchTitle: title.toLowerCase(),
+      searchSnippet: snippet.toLowerCase(),
       tags: userTags.slice(),
       updated: relTime(s.lastTs),
       updatedSort: s.mtime || 0,

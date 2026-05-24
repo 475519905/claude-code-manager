@@ -5,6 +5,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_NAME="ClaudeManager"
 MANAGER_KIND="${MANAGER_KIND:-claude}"
 ARCH="${ARCH:-$(uname -m)}"
+RELEASE_CXX_FLAGS="${RELEASE_CXX_FLAGS:--O2 -DNDEBUG}"
 BUILD_DIR="${ROOT}/build-mac"
 PACKAGE_DIR="${ROOT}/../dist/cpp/${APP_NAME}-macos-${ARCH}"
 APP_SRC="${BUILD_DIR}/conv_manager_cpp.app"
@@ -14,7 +15,8 @@ ZIP_PATH="${ROOT}/../dist/cpp/${APP_NAME}-macos-${ARCH}.zip"
 cmake -S "${ROOT}" -B "${BUILD_DIR}" \
   -DCMAKE_BUILD_TYPE=Release \
   -DMANAGER_KIND="${MANAGER_KIND}" \
-  -DCMAKE_OSX_ARCHITECTURES="${ARCH}"
+  -DCMAKE_OSX_ARCHITECTURES="${ARCH}" \
+  -DCMAKE_CXX_FLAGS_RELEASE="${RELEASE_CXX_FLAGS}"
 cmake --build "${BUILD_DIR}" --config Release
 
 rm -rf "${PACKAGE_DIR}"
