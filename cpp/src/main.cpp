@@ -138,6 +138,7 @@ std::vector<Candidate> g_candidate_cache;
 std::atomic_bool g_search_warmup_running{false};
 std::unordered_map<std::string, std::shared_ptr<SearchEntry>> g_search_blobs;
 std::unordered_map<std::string, SearchIndexEntry> g_search_index_cache;
+bool g_search_catalog_loaded = false;
 std::unordered_map<std::string, DetailEntry> g_detail_cache;
 std::optional<json> g_index_cache;
 
@@ -1352,6 +1353,10 @@ fs::path search_index_sidecar_path(const Config& cfg, const std::string& key) {
     return cfg.search_index_dir / (search_index_key64(search_index_key_hash(key), 16) + ".bin");
 }
 
+fs::path search_index_catalog_path(const Config& cfg) {
+    return cfg.search_index_dir / "catalog.bin";
+}
+
 template <typename T>
 bool write_scalar(std::ofstream& out, const T& value) {
     out.write(reinterpret_cast<const char*>(&value), sizeof(T));
@@ -1362,6 +1367,56 @@ template <typename T>
 bool read_scalar(std::ifstream& in, T& value) {
     in.read(reinterpret_cast<char*>(&value), sizeof(T));
     return static_cast<bool>(in);
+}
+
+bool write_search_index_payload(std::ofstream& out, const std::string& key, const SearchIndexEntry& entry) {
+    const std::uint64_t size = static_cast<std::uint64_t>(entry.size);
+    const std::uint32_t key_len = static_cast<std::uint32_t>(key.size());
+    const std::uint32_t gram_count = static_cast<std::uint32_t>(entry.grams.size());
+    const std::uint32_t bloom_words = static_cast<std::uint32_t>(entry.token_bloom.size());
+    if (!write_scalar(out, size) || !write_scalar(out, entry.mtime) ||
+        !write_scalar(out, key_len) || !write_scalar(out, gram_count) ||
+        !write_scalar(out, bloom_words)) {
+        return false;
+    }
+    out.write(key.data(), static_cast<std::streamsize>(key.size()));
+    if (!entry.grams.empty()) {
+        out.write(reinterpret_cast<const char*>(entry.grams.data()), static_cast<std::streamsize>(entry.grams.size() * sizeof(std::uint32_t)));
+    }
+    if (!entry.token_bloom.empty()) {
+        out.write(reinterpret_cast<const char*>(entry.token_bloom.data()), static_cast<std::streamsize>(entry.token_bloom.size() * sizeof(std::uint64_t)));
+    }
+    return static_cast<bool>(out);
+}
+
+bool read_search_index_payload(std::ifstream& in, std::string& key, SearchIndexEntry& entry) {
+    std::uint64_t size = 0;
+    double mtime = 0.0;
+    std::uint32_t key_len = 0, gram_count = 0, bloom_words = 0;
+    if (!read_scalar(in, size) || !read_scalar(in, mtime) ||
+        !read_scalar(in, key_len) || !read_scalar(in, gram_count) ||
+        !read_scalar(in, bloom_words)) {
+        return false;
+    }
+    if (key_len > 4096 || gram_count > (1u << 24) || bloom_words != kSearchIndexTokenBloomWords) return false;
+    std::string stored_key(key_len, '\0');
+    in.read(stored_key.data(), key_len);
+    if (!in) return false;
+    SearchIndexEntry loaded;
+    loaded.size = static_cast<std::uintmax_t>(size);
+    loaded.mtime = mtime;
+    loaded.grams.resize(gram_count);
+    loaded.token_bloom.resize(bloom_words);
+    if (!loaded.grams.empty()) {
+        in.read(reinterpret_cast<char*>(loaded.grams.data()), static_cast<std::streamsize>(loaded.grams.size() * sizeof(std::uint32_t)));
+    }
+    if (!loaded.token_bloom.empty()) {
+        in.read(reinterpret_cast<char*>(loaded.token_bloom.data()), static_cast<std::streamsize>(loaded.token_bloom.size() * sizeof(std::uint64_t)));
+    }
+    if (!in) return false;
+    key = std::move(stored_key);
+    entry = std::move(loaded);
+    return true;
 }
 
 SearchIndexEntry build_session_search_index(const Config& cfg, const Candidate& c) {
@@ -1405,23 +1460,10 @@ bool save_search_index_sidecar(const Config& cfg, const std::string& key, const 
         const std::uint32_t token_gram_bytes = static_cast<std::uint32_t>(kSearchIndexTokenGramBytes);
         const std::uint32_t bloom_bits = static_cast<std::uint32_t>(kSearchIndexTokenBloomBits);
         const std::uint32_t bloom_probes = static_cast<std::uint32_t>(kSearchIndexTokenBloomProbes);
-        const std::uint64_t size = static_cast<std::uint64_t>(entry.size);
-        const std::uint32_t key_len = static_cast<std::uint32_t>(key.size());
-        const std::uint32_t gram_count = static_cast<std::uint32_t>(entry.grams.size());
-        const std::uint32_t bloom_words = static_cast<std::uint32_t>(entry.token_bloom.size());
         if (!write_scalar(out, version) || !write_scalar(out, gram_bytes) ||
             !write_scalar(out, token_gram_bytes) || !write_scalar(out, bloom_bits) ||
-            !write_scalar(out, bloom_probes) || !write_scalar(out, size) ||
-            !write_scalar(out, entry.mtime) || !write_scalar(out, key_len) ||
-            !write_scalar(out, gram_count) || !write_scalar(out, bloom_words)) {
+            !write_scalar(out, bloom_probes) || !write_search_index_payload(out, key, entry)) {
             return false;
-        }
-        out.write(key.data(), static_cast<std::streamsize>(key.size()));
-        if (!entry.grams.empty()) {
-            out.write(reinterpret_cast<const char*>(entry.grams.data()), static_cast<std::streamsize>(entry.grams.size() * sizeof(std::uint32_t)));
-        }
-        if (!entry.token_bloom.empty()) {
-            out.write(reinterpret_cast<const char*>(entry.token_bloom.data()), static_cast<std::streamsize>(entry.token_bloom.size() * sizeof(std::uint64_t)));
         }
         out.close();
         if (!out) return false;
@@ -1444,39 +1486,101 @@ bool load_search_index_sidecar(const Config& cfg, const std::string& key, Search
     in.read(magic, sizeof(magic));
     if (!in || std::string(magic, magic + 7) != "CMSIDX6") return false;
     std::uint32_t version = 0, gram_bytes = 0, token_gram_bytes = 0, bloom_bits = 0, bloom_probes = 0;
-    std::uint64_t size = 0;
-    double mtime = 0.0;
-    std::uint32_t key_len = 0, gram_count = 0, bloom_words = 0;
     if (!read_scalar(in, version) || !read_scalar(in, gram_bytes) ||
         !read_scalar(in, token_gram_bytes) || !read_scalar(in, bloom_bits) ||
-        !read_scalar(in, bloom_probes) || !read_scalar(in, size) ||
-        !read_scalar(in, mtime) || !read_scalar(in, key_len) ||
-        !read_scalar(in, gram_count) || !read_scalar(in, bloom_words)) {
+        !read_scalar(in, bloom_probes)) {
         return false;
     }
     if (version != kSearchIndexVersion || gram_bytes != kSearchIndexMinGramQueryBytes ||
         token_gram_bytes != kSearchIndexTokenGramBytes || bloom_bits != kSearchIndexTokenBloomBits ||
-        bloom_probes != kSearchIndexTokenBloomProbes || bloom_words != kSearchIndexTokenBloomWords ||
-        key_len != key.size()) {
+        bloom_probes != kSearchIndexTokenBloomProbes) {
         return false;
     }
-    std::string stored_key(key_len, '\0');
-    in.read(stored_key.data(), key_len);
-    if (!in || stored_key != key) return false;
-    SearchIndexEntry loaded;
-    loaded.size = static_cast<std::uintmax_t>(size);
-    loaded.mtime = mtime;
-    loaded.grams.resize(gram_count);
-    loaded.token_bloom.resize(bloom_words);
-    if (!loaded.grams.empty()) {
-        in.read(reinterpret_cast<char*>(loaded.grams.data()), static_cast<std::streamsize>(loaded.grams.size() * sizeof(std::uint32_t)));
+    std::string stored_key;
+    if (!read_search_index_payload(in, stored_key, entry)) return false;
+    return stored_key == key;
+}
+
+void load_search_index_catalog_once(const Config& cfg) {
+    {
+        std::lock_guard<std::mutex> lock(g_index_mutex);
+        if (g_search_catalog_loaded) return;
+        g_search_catalog_loaded = true;
     }
-    if (!loaded.token_bloom.empty()) {
-        in.read(reinterpret_cast<char*>(loaded.token_bloom.data()), static_cast<std::streamsize>(loaded.token_bloom.size() * sizeof(std::uint64_t)));
+
+    std::ifstream in(search_index_catalog_path(cfg), std::ios::binary);
+    if (!in) return;
+    char magic[8]{};
+    in.read(magic, sizeof(magic));
+    if (!in || std::string(magic, magic + 7) != "CMSCAT6") return;
+    std::uint32_t version = 0, gram_bytes = 0, token_gram_bytes = 0, bloom_bits = 0, bloom_probes = 0, entry_count = 0;
+    if (!read_scalar(in, version) || !read_scalar(in, gram_bytes) ||
+        !read_scalar(in, token_gram_bytes) || !read_scalar(in, bloom_bits) ||
+        !read_scalar(in, bloom_probes) || !read_scalar(in, entry_count)) {
+        return;
     }
-    if (!in) return false;
-    entry = std::move(loaded);
-    return true;
+    if (version != kSearchIndexVersion || gram_bytes != kSearchIndexMinGramQueryBytes ||
+        token_gram_bytes != kSearchIndexTokenGramBytes || bloom_bits != kSearchIndexTokenBloomBits ||
+        bloom_probes != kSearchIndexTokenBloomProbes || entry_count > 100000) {
+        return;
+    }
+
+    std::unordered_map<std::string, SearchIndexEntry> loaded;
+    loaded.reserve(entry_count);
+    for (std::uint32_t i = 0; i < entry_count; ++i) {
+        std::string key;
+        SearchIndexEntry entry;
+        if (!read_search_index_payload(in, key, entry)) return;
+        loaded[std::move(key)] = std::move(entry);
+    }
+
+    std::lock_guard<std::mutex> lock(g_index_mutex);
+    for (auto& [key, entry] : loaded) {
+        g_search_index_cache[std::move(key)] = std::move(entry);
+    }
+}
+
+bool save_search_index_catalog(const Config& cfg) {
+    try {
+        fs::create_directories(cfg.search_index_dir);
+        const auto path = search_index_catalog_path(cfg);
+        const auto tmp = path.string() + ".tmp";
+        std::ofstream out(tmp, std::ios::binary);
+        if (!out) return false;
+        const char magic[8] = {'C', 'M', 'S', 'C', 'A', 'T', '6', '\0'};
+        out.write(magic, sizeof(magic));
+        const std::uint32_t version = kSearchIndexVersion;
+        const std::uint32_t gram_bytes = static_cast<std::uint32_t>(kSearchIndexMinGramQueryBytes);
+        const std::uint32_t token_gram_bytes = static_cast<std::uint32_t>(kSearchIndexTokenGramBytes);
+        const std::uint32_t bloom_bits = static_cast<std::uint32_t>(kSearchIndexTokenBloomBits);
+        const std::uint32_t bloom_probes = static_cast<std::uint32_t>(kSearchIndexTokenBloomProbes);
+        std::vector<std::pair<std::string, SearchIndexEntry>> entries;
+        {
+            std::lock_guard<std::mutex> lock(g_index_mutex);
+            entries.reserve(g_search_index_cache.size());
+            for (const auto& [key, entry] : g_search_index_cache) entries.push_back({key, entry});
+        }
+        const std::uint32_t entry_count = static_cast<std::uint32_t>(entries.size());
+        if (!write_scalar(out, version) || !write_scalar(out, gram_bytes) ||
+            !write_scalar(out, token_gram_bytes) || !write_scalar(out, bloom_bits) ||
+            !write_scalar(out, bloom_probes) || !write_scalar(out, entry_count)) {
+            return false;
+        }
+        for (const auto& [key, entry] : entries) {
+            if (!write_search_index_payload(out, key, entry)) return false;
+        }
+        out.close();
+        if (!out) return false;
+        std::error_code ec;
+        fs::rename(tmp, path, ec);
+        if (ec) {
+            fs::remove(path, ec);
+            fs::rename(tmp, path, ec);
+        }
+        return !ec;
+    } catch (...) {
+        return false;
+    }
 }
 
 bool is_jsonl_boundary(const fs::path& path, std::uintmax_t offset) {
@@ -1589,6 +1693,7 @@ bool search_index_may_contain(const SearchIndexEntry& entry, const std::vector<s
 
 std::vector<Candidate> filter_candidates_by_search_index(const Config& cfg, const std::vector<Candidate>& files, const std::vector<std::uint32_t>& query_keys, const std::vector<std::uint64_t>& query_token_keys) {
     if ((query_keys.empty() && query_token_keys.empty()) || files.empty()) return files;
+    load_search_index_catalog_once(cfg);
     std::vector<Candidate> out;
     out.reserve(files.size());
     for (auto c : files) {
@@ -1725,6 +1830,7 @@ void start_search_warmup(const Config& cfg) {
     if (!g_search_warmup_running.compare_exchange_strong(expected, true)) return;
     std::thread([cfg] {
         try {
+            load_search_index_catalog_once(cfg);
             const auto files = enumerate_files_cached(cfg);
             if (!files.empty()) {
                 std::atomic_size_t next{0};
@@ -1744,6 +1850,7 @@ void start_search_warmup(const Config& cfg) {
                     });
                 }
                 for (auto& thread : threads) thread.join();
+                save_search_index_catalog(cfg);
             }
         } catch (...) {
         }
@@ -2787,6 +2894,7 @@ void register_routes(httplib::Server& svr, const Config& cfg) {
             std::lock_guard<std::mutex> lock(g_index_mutex);
             g_index_cache.reset();
             g_search_index_cache.clear();
+            g_search_catalog_loaded = false;
         }
         clear_candidate_cache(cfg);
         {
