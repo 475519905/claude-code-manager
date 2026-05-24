@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cctype>
 #include <cstdio>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
@@ -17,6 +18,7 @@
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -51,6 +53,12 @@ using json = nlohmann::json;
 namespace {
 
 constexpr double kActiveWindowSecs = 180.0;
+constexpr int kSearchIndexVersion = 6;
+constexpr size_t kSearchIndexMinGramQueryBytes = 3;
+constexpr size_t kSearchIndexTokenGramBytes = 5;
+constexpr size_t kSearchIndexTokenBloomBits = 1u << 23;
+constexpr size_t kSearchIndexTokenBloomWords = kSearchIndexTokenBloomBits / 64;
+constexpr size_t kSearchIndexTokenBloomProbes = 6;
 
 enum class UiMode {
     Window,
@@ -107,6 +115,13 @@ struct SearchEntry {
     std::unordered_map<std::string, json> hit_cache;
 };
 
+struct SearchIndexEntry {
+    double mtime = 0.0;
+    std::uintmax_t size = 0;
+    std::vector<std::uint32_t> grams;
+    std::vector<std::uint64_t> token_bloom;
+};
+
 struct DetailEntry {
     double mtime = 0.0;
     std::uintmax_t size = 0;
@@ -121,6 +136,7 @@ std::string g_candidate_cache_key;
 std::vector<Candidate> g_candidate_cache;
 std::atomic_bool g_search_warmup_running{false};
 std::unordered_map<std::string, std::shared_ptr<SearchEntry>> g_search_blobs;
+std::unordered_map<std::string, SearchIndexEntry> g_search_index_cache;
 std::unordered_map<std::string, DetailEntry> g_detail_cache;
 std::optional<json> g_index_cache;
 
@@ -779,7 +795,7 @@ std::pair<json, json> scan_codex_session(const std::string& project, const Candi
     return {summary_obj, rows};
 }
 
-json load_index(const Config& cfg) {
+json& load_index(const Config& cfg) {
     if (g_index_cache) return *g_index_cache;
     std::ifstream in(cfg.index_file, std::ios::binary);
     if (in) {
@@ -787,7 +803,7 @@ json load_index(const Config& cfg) {
         ss << in.rdbuf();
         auto data = json::parse(ss.str(), nullptr, false);
         if (data.is_object() && field_int(data, "version") == 1 && data.contains("entries") && data["entries"].is_object()) {
-            g_index_cache = data;
+            g_index_cache = std::move(data);
             return *g_index_cache;
         }
     }
@@ -972,6 +988,27 @@ std::pair<json, json> scan_session(const Config& cfg, const Candidate& c) {
     return cfg.is_codex ? scan_codex_session(c.project, c) : scan_claude_session(c.project, c);
 }
 
+bool index_entry_matches_candidate(const json& entry, const Candidate& c) {
+    if (!entry.is_object()) return false;
+    const auto size = static_cast<long long>(c.size);
+    const auto mtime = entry.contains("mtime") && entry["mtime"].is_number() ? entry["mtime"].get<double>() : 0.0;
+    return field_int(entry, "size") == size && std::abs(mtime - c.mtime) < 0.000001;
+}
+
+bool entry_has_current_search_index(const json& entry) {
+    return entry.is_object() &&
+           field_int(entry, "searchIndexVersion") == kSearchIndexVersion &&
+           field_int(entry, "searchIndexGramBytes") == static_cast<long long>(kSearchIndexMinGramQueryBytes) &&
+           field_int(entry, "searchIndexTokenGramBytes") == static_cast<long long>(kSearchIndexTokenGramBytes) &&
+           field_int(entry, "searchIndexTokenBloomBits") == static_cast<long long>(kSearchIndexTokenBloomBits) &&
+           field_int(entry, "searchIndexTokenBloomProbes") == static_cast<long long>(kSearchIndexTokenBloomProbes) &&
+           entry.contains("searchIndexKeys") && entry["searchIndexKeys"].is_array() &&
+           entry.contains("searchIndexTokenBloom") && entry["searchIndexTokenBloom"].is_string();
+}
+
+bool attach_session_search_index(const Config& cfg, const Candidate& c, json& entry);
+bool remember_search_index_from_entry(const std::string& key, const Candidate& c, const json& entry);
+
 std::pair<json, json> load_session_summaries(const Config& cfg) {
     const auto files = enumerate_files(cfg);
     json projects = json::array();
@@ -979,7 +1016,7 @@ std::pair<json, json> load_session_summaries(const Config& cfg) {
     std::map<std::string, int> project_counts;
 
     std::lock_guard<std::mutex> lock(g_index_mutex);
-    auto index = load_index(cfg);
+    auto& index = load_index(cfg);
     auto& entries = index["entries"];
     std::set<std::string> seen_keys;
     bool dirty = false;
@@ -989,17 +1026,22 @@ std::pair<json, json> load_session_summaries(const Config& cfg) {
         seen_keys.insert(key);
         json summary;
         auto cached_it = entries.find(key);
-        const bool fresh = cached_it != entries.end() && cached_it->is_object() &&
-                           std::abs(field_int(*cached_it, "size") - static_cast<long long>(c.size)) == 0 &&
-                           std::abs(((*cached_it)["mtime"].is_number() ? (*cached_it)["mtime"].get<double>() : 0.0) - c.mtime) < 0.000001 &&
+        const bool fresh = cached_it != entries.end() && index_entry_matches_candidate(*cached_it, c) &&
                            cached_it->contains("data") && (*cached_it)["data"].is_object();
         if (fresh) {
             summary = (*cached_it)["data"];
+            if (!entry_has_current_search_index(*cached_it) && attach_session_search_index(cfg, c, *cached_it)) {
+                dirty = true;
+            } else if (entry_has_current_search_index(*cached_it)) {
+                remember_search_index_from_entry(key, c, *cached_it);
+            }
         } else {
             try {
                 auto [scanned, costs] = scan_session(cfg, c);
                 summary = scanned;
-                entries[key] = json{{"mtime", c.mtime}, {"size", c.size}, {"data", scanned}, {"costs", costs}};
+                auto entry = json{{"mtime", c.mtime}, {"size", c.size}, {"data", scanned}, {"costs", costs}};
+                attach_session_search_index(cfg, c, entry);
+                entries[key] = std::move(entry);
                 dirty = true;
             } catch (const std::exception& e) {
                 summary = {
@@ -1022,10 +1064,10 @@ std::pair<json, json> load_session_summaries(const Config& cfg) {
     }
     for (const auto& key : stale) {
         entries.erase(key);
+        g_search_index_cache.erase(key);
         dirty = true;
     }
     if (dirty) {
-        g_index_cache = index;
         save_index(cfg, index);
     }
 
@@ -1071,6 +1113,358 @@ void add_search_record(const Config& cfg, const json& obj, std::vector<SearchEnt
     }
     if (text.empty()) return;
     records.push_back({role, std::move(text), field_string(obj, "timestamp")});
+}
+
+unsigned char search_index_byte(char c) {
+    const auto uc = static_cast<unsigned char>(c);
+    return uc < 128 ? static_cast<unsigned char>(std::tolower(uc)) : uc;
+}
+
+std::uint32_t search_index_gram(unsigned char a, unsigned char b, unsigned char c) {
+    return (static_cast<std::uint32_t>(a) << 16) |
+           (static_cast<std::uint32_t>(b) << 8) |
+           static_cast<std::uint32_t>(c);
+}
+
+std::string search_index_key(std::uint32_t gram) {
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::string out(6, '0');
+    for (int i = 5; i >= 0; --i) {
+        out[static_cast<size_t>(i)] = kHex[gram & 0x0F];
+        gram >>= 4;
+    }
+    return out;
+}
+
+std::string search_index_key64(std::uint64_t gram, size_t width) {
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::string out(width, '0');
+    for (size_t i = width; i > 0; --i) {
+        out[i - 1] = kHex[gram & 0x0F];
+        gram >>= 4;
+    }
+    return out;
+}
+
+bool search_index_token_byte(unsigned char c) {
+    return c < 128 && (std::isalnum(c) || c == '_');
+}
+
+std::uint64_t search_index_mix64(std::uint64_t value) {
+    value += 0x9e3779b97f4a7c15ULL;
+    value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    value = (value ^ (value >> 27)) * 0x94d049bb133111ebULL;
+    return value ^ (value >> 31);
+}
+
+void search_index_bloom_add(std::vector<std::uint64_t>& bloom, std::uint64_t gram) {
+    if (bloom.size() != kSearchIndexTokenBloomWords) bloom.assign(kSearchIndexTokenBloomWords, 0);
+    const auto h1 = search_index_mix64(gram);
+    const auto h2 = search_index_mix64(gram ^ 0xd6e8feb86659fd93ULL) | 1ULL;
+    for (size_t i = 0; i < kSearchIndexTokenBloomProbes; ++i) {
+        const auto bit = (h1 + i * h2) & (kSearchIndexTokenBloomBits - 1);
+        bloom[bit >> 6] |= (1ULL << (bit & 63));
+    }
+}
+
+bool search_index_bloom_may_contain(const std::vector<std::uint64_t>& bloom, std::uint64_t gram) {
+    if (bloom.size() != kSearchIndexTokenBloomWords) return true;
+    const auto h1 = search_index_mix64(gram);
+    const auto h2 = search_index_mix64(gram ^ 0xd6e8feb86659fd93ULL) | 1ULL;
+    for (size_t i = 0; i < kSearchIndexTokenBloomProbes; ++i) {
+        const auto bit = (h1 + i * h2) & (kSearchIndexTokenBloomBits - 1);
+        if ((bloom[bit >> 6] & (1ULL << (bit & 63))) == 0) return false;
+    }
+    return true;
+}
+
+void add_search_index_grams(std::string_view text, std::unordered_set<std::uint32_t>& grams) {
+    if (text.size() < kSearchIndexMinGramQueryBytes) return;
+    auto a = search_index_byte(text[0]);
+    auto b = search_index_byte(text[1]);
+    for (size_t i = 2; i < text.size(); ++i) {
+        const auto c = search_index_byte(text[i]);
+        grams.insert(search_index_gram(a, b, c));
+        a = b;
+        b = c;
+    }
+}
+
+void add_search_index_token_grams(std::string_view text, std::vector<std::uint64_t>& token_bloom) {
+    std::uint64_t window = 0;
+    size_t token_len = 0;
+    for (const auto ch : text) {
+        const auto c = search_index_byte(ch);
+        if (!search_index_token_byte(c)) {
+            window = 0;
+            token_len = 0;
+            continue;
+        }
+        window = ((window << 8) | static_cast<std::uint64_t>(c)) & 0xFFFFFFFFFFULL;
+        ++token_len;
+        if (token_len >= kSearchIndexTokenGramBytes) search_index_bloom_add(token_bloom, window);
+    }
+}
+
+void add_search_index_token_query_grams(std::string_view text, std::unordered_set<std::uint64_t>& token_grams) {
+    std::uint64_t window = 0;
+    size_t token_len = 0;
+    for (const auto ch : text) {
+        const auto c = search_index_byte(ch);
+        if (!search_index_token_byte(c)) {
+            window = 0;
+            token_len = 0;
+            continue;
+        }
+        window = ((window << 8) | static_cast<std::uint64_t>(c)) & 0xFFFFFFFFFFULL;
+        ++token_len;
+        if (token_len >= kSearchIndexTokenGramBytes) token_grams.insert(window);
+    }
+}
+
+std::vector<std::uint32_t> sorted_search_index_grams(const std::unordered_set<std::uint32_t>& grams) {
+    std::vector<std::uint32_t> sorted(grams.begin(), grams.end());
+    std::sort(sorted.begin(), sorted.end());
+    return sorted;
+}
+
+json search_index_keys_json(const std::vector<std::uint32_t>& sorted) {
+    json keys = json::array();
+    for (const auto gram : sorted) keys.push_back(search_index_key(gram));
+    return keys;
+}
+
+std::string search_index_bloom_hex(const std::vector<std::uint64_t>& bloom) {
+    size_t words = bloom.size();
+    while (words > 0 && bloom[words - 1] == 0) --words;
+    std::string out;
+    out.reserve(words * 16);
+    for (size_t i = 0; i < words; ++i) out += search_index_key64(bloom[i], 16);
+    return out;
+}
+
+std::vector<std::uint32_t> search_query_index_keys(std::string_view qlower) {
+    std::unordered_set<std::uint32_t> grams;
+    add_search_index_grams(qlower, grams);
+    return sorted_search_index_grams(grams);
+}
+
+std::vector<std::uint64_t> search_query_token_index_keys(std::string_view qlower) {
+    std::unordered_set<std::uint64_t> grams;
+    add_search_index_token_query_grams(qlower, grams);
+    std::vector<std::uint64_t> sorted(grams.begin(), grams.end());
+    std::sort(sorted.begin(), sorted.end());
+    return sorted;
+}
+
+int search_index_hex_value(char ch) {
+    if (ch >= '0' && ch <= '9') return ch - '0';
+    if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
+    if (ch >= 'A' && ch <= 'F') return ch - 'A' + 10;
+    return -1;
+}
+
+std::optional<std::uint32_t> parse_search_index_key(std::string_view key) {
+    if (key.size() != 6) return std::nullopt;
+    std::uint32_t value = 0;
+    for (const auto ch : key) {
+        const auto digit = search_index_hex_value(ch);
+        if (digit < 0) return std::nullopt;
+        value = (value << 4) | static_cast<std::uint32_t>(digit);
+    }
+    return value;
+}
+
+std::optional<std::uint64_t> parse_search_index_hex64(std::string_view key) {
+    if (key.size() != 16) return std::nullopt;
+    std::uint64_t value = 0;
+    for (const auto ch : key) {
+        const auto digit = search_index_hex_value(ch);
+        if (digit < 0) return std::nullopt;
+        value = (value << 4) | static_cast<std::uint64_t>(digit);
+    }
+    return value;
+}
+
+bool parse_search_index_keys_json(const json& values, std::vector<std::uint32_t>& grams) {
+    if (!values.is_array()) return false;
+    grams.clear();
+    grams.reserve(values.size());
+    for (const auto& value : values) {
+        if (!value.is_string()) return false;
+        const auto parsed = parse_search_index_key(value.get<std::string>());
+        if (!parsed) return false;
+        grams.push_back(*parsed);
+    }
+    std::sort(grams.begin(), grams.end());
+    grams.erase(std::unique(grams.begin(), grams.end()), grams.end());
+    return true;
+}
+
+bool parse_search_index_bloom_hex(const json& value, std::vector<std::uint64_t>& bloom) {
+    if (!value.is_string()) return false;
+    const auto hex = value.get<std::string>();
+    if (hex.size() % 16 != 0 || hex.size() / 16 > kSearchIndexTokenBloomWords) return false;
+    bloom.assign(kSearchIndexTokenBloomWords, 0);
+    for (size_t i = 0; i < hex.size(); i += 16) {
+        const auto parsed = parse_search_index_hex64(std::string_view(hex).substr(i, 16));
+        if (!parsed) return false;
+        bloom[i / 16] = *parsed;
+    }
+    return true;
+}
+
+std::uintmax_t entry_search_index_size(const json& entry) {
+    if (entry.contains("searchIndexSize")) return static_cast<std::uintmax_t>(std::max<long long>(0, field_int(entry, "searchIndexSize")));
+    return static_cast<std::uintmax_t>(std::max<long long>(0, field_int(entry, "size")));
+}
+
+double entry_search_index_mtime(const json& entry) {
+    if (entry.contains("searchIndexMtime") && entry["searchIndexMtime"].is_number()) return entry["searchIndexMtime"].get<double>();
+    return entry.contains("mtime") && entry["mtime"].is_number() ? entry["mtime"].get<double>() : 0.0;
+}
+
+bool remember_search_index_from_entry(const std::string& key, const Candidate& c, const json& entry) {
+    (void)c;
+    if (!entry_has_current_search_index(entry)) return false;
+    SearchIndexEntry cached;
+    cached.mtime = entry_search_index_mtime(entry);
+    cached.size = entry_search_index_size(entry);
+    if (!parse_search_index_keys_json(entry["searchIndexKeys"], cached.grams)) return false;
+    if (!parse_search_index_bloom_hex(entry["searchIndexTokenBloom"], cached.token_bloom)) return false;
+    g_search_index_cache[key] = std::move(cached);
+    return true;
+}
+
+bool attach_session_search_index(const Config& cfg, const Candidate& c, json& entry) {
+    std::ifstream in(c.path, std::ios::binary);
+    if (!in) return false;
+    std::unordered_set<std::uint32_t> grams;
+    std::vector<std::uint64_t> token_bloom(kSearchIndexTokenBloomWords, 0);
+    const auto reserve_hint = static_cast<size_t>(std::min<std::uintmax_t>(c.size / 128, 262144));
+    if (reserve_hint > 0) grams.reserve(reserve_hint);
+    std::string line;
+    while (std::getline(in, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        auto obj = json::parse(line, nullptr, false);
+        if (obj.is_discarded()) continue;
+        std::vector<SearchEntry::Record> records;
+        add_search_record(cfg, obj, records);
+        for (const auto& record : records) {
+            add_search_index_grams(record.text, grams);
+            add_search_index_token_grams(record.text, token_bloom);
+        }
+    }
+    auto sorted = sorted_search_index_grams(grams);
+    entry.erase("searchIndexTokenKeys");
+    entry["searchIndexVersion"] = kSearchIndexVersion;
+    entry["searchIndexGramBytes"] = kSearchIndexMinGramQueryBytes;
+    entry["searchIndexTokenGramBytes"] = kSearchIndexTokenGramBytes;
+    entry["searchIndexTokenBloomBits"] = kSearchIndexTokenBloomBits;
+    entry["searchIndexTokenBloomProbes"] = kSearchIndexTokenBloomProbes;
+    entry["searchIndexSize"] = c.size;
+    entry["searchIndexMtime"] = c.mtime;
+    entry["searchIndexKeys"] = search_index_keys_json(sorted);
+    entry["searchIndexTokenBloom"] = search_index_bloom_hex(token_bloom);
+    g_search_index_cache[relative_key(c)] = SearchIndexEntry{c.mtime, c.size, std::move(sorted), std::move(token_bloom)};
+    return true;
+}
+
+bool is_jsonl_boundary(const fs::path& path, std::uintmax_t offset) {
+    if (offset == 0) return true;
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return false;
+    in.seekg(static_cast<std::streamoff>(offset - 1));
+    char ch = 0;
+    return static_cast<bool>(in.get(ch)) && ch == '\n';
+}
+
+bool add_search_index_grams_from_jsonl(const Config& cfg, const Candidate& c, std::uintmax_t offset, std::unordered_set<std::uint32_t>& grams, std::vector<std::uint64_t>& token_bloom) {
+    if (!is_jsonl_boundary(c.path, offset)) return false;
+    std::ifstream in(c.path, std::ios::binary);
+    if (!in) return false;
+    in.seekg(static_cast<std::streamoff>(offset));
+    std::string line;
+    while (std::getline(in, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (trim(line).empty()) continue;
+        auto obj = json::parse(line, nullptr, false);
+        if (obj.is_discarded()) return false;
+        std::vector<SearchEntry::Record> records;
+        add_search_record(cfg, obj, records);
+        for (const auto& record : records) {
+            add_search_index_grams(record.text, grams);
+            add_search_index_token_grams(record.text, token_bloom);
+        }
+    }
+    return true;
+}
+
+bool ensure_search_index_cache_current(const Config& cfg, const std::string& key, const Candidate& c, const json& entry) {
+    auto cache_it = g_search_index_cache.find(key);
+    if (cache_it == g_search_index_cache.end()) {
+        if (!remember_search_index_from_entry(key, c, entry)) return false;
+        cache_it = g_search_index_cache.find(key);
+        if (cache_it == g_search_index_cache.end()) return false;
+    }
+    auto& cached = cache_it->second;
+    if (cached.size == c.size && std::abs(cached.mtime - c.mtime) < 0.000001) return true;
+    if (c.size <= cached.size) return false;
+
+    std::unordered_set<std::uint32_t> additions;
+    auto updated_bloom = cached.token_bloom;
+    if (!add_search_index_grams_from_jsonl(cfg, c, cached.size, additions, updated_bloom)) return false;
+    auto sorted_additions = sorted_search_index_grams(additions);
+    std::vector<std::uint32_t> merged;
+    merged.reserve(cached.grams.size() + sorted_additions.size());
+    std::set_union(cached.grams.begin(), cached.grams.end(),
+                   sorted_additions.begin(), sorted_additions.end(),
+                   std::back_inserter(merged));
+    cached.grams = std::move(merged);
+    cached.token_bloom = std::move(updated_bloom);
+    cached.size = c.size;
+    cached.mtime = c.mtime;
+    return true;
+}
+
+bool search_index_may_contain(const SearchIndexEntry& entry, const std::vector<std::uint32_t>& query_keys, const std::vector<std::uint64_t>& query_token_keys) {
+    for (const auto key : query_keys) {
+        if (!std::binary_search(entry.grams.begin(), entry.grams.end(), key)) return false;
+    }
+    for (const auto key : query_token_keys) {
+        if (!search_index_bloom_may_contain(entry.token_bloom, key)) return false;
+    }
+    return true;
+}
+
+std::vector<Candidate> filter_candidates_by_search_index(const Config& cfg, const std::vector<Candidate>& files, const std::vector<std::uint32_t>& query_keys, const std::vector<std::uint64_t>& query_token_keys) {
+    if ((query_keys.empty() && query_token_keys.empty()) || files.empty()) return files;
+    std::vector<Candidate> out;
+    out.reserve(files.size());
+    std::lock_guard<std::mutex> lock(g_index_mutex);
+    const auto& index = load_index(cfg);
+    const auto entries_it = index.find("entries");
+    if (entries_it == index.end() || !entries_it->is_object()) return files;
+    const auto& entries = *entries_it;
+    for (auto c : files) {
+        c.size = file_size_or_zero(c.path);
+        c.mtime = unix_mtime(c.path);
+        const auto key = relative_key(c);
+        const auto it = entries.find(key);
+        if (it == entries.end() || !entry_has_current_search_index(*it)) {
+            g_search_index_cache.erase(key);
+            out.push_back(std::move(c));
+            continue;
+        }
+        if (!ensure_search_index_cache_current(cfg, key, c, *it)) {
+            g_search_index_cache.erase(key);
+            out.push_back(std::move(c));
+            continue;
+        }
+        auto cache_it = g_search_index_cache.find(key);
+        if (cache_it == g_search_index_cache.end() || search_index_may_contain(cache_it->second, query_keys, query_token_keys)) out.push_back(std::move(c));
+    }
+    return out;
 }
 
 std::shared_ptr<SearchEntry> ensure_search_entry(const Candidate& c) {
@@ -1305,7 +1699,7 @@ json aggregate_costs(const Config& cfg) {
     auto [projects, sessions] = load_session_summaries(cfg);
     (void)projects;
     std::lock_guard<std::mutex> lock(g_index_mutex);
-    auto index = load_index(cfg);
+    const auto& index = load_index(cfg);
 
     if (cfg.is_codex) {
         json by_model = json::object();
@@ -2242,6 +2636,7 @@ void register_routes(httplib::Server& svr, const Config& cfg) {
         {
             std::lock_guard<std::mutex> lock(g_index_mutex);
             g_index_cache.reset();
+            g_search_index_cache.clear();
         }
         clear_candidate_cache(cfg);
         {
@@ -2272,21 +2667,25 @@ void register_routes(httplib::Server& svr, const Config& cfg) {
         }
         const auto qlower = lower_ascii(query);
         const auto files = enumerate_files_cached(cfg);
+        const bool raw_search = req.has_param("raw") && req.get_param_value("raw") == "1";
+        const auto query_keys = raw_search ? std::vector<std::uint32_t>() : search_query_index_keys(qlower);
+        const auto query_token_keys = raw_search ? std::vector<std::uint64_t>() : search_query_token_index_keys(qlower);
+        const auto search_files = raw_search ? files : filter_candidates_by_search_index(cfg, files, query_keys, query_token_keys);
         json results = json::array();
-        std::vector<json> result_items(files.size());
+        std::vector<json> result_items(search_files.size());
         std::atomic_size_t next{0};
-        const auto workers = std::max<size_t>(1, std::min<size_t>(8, files.size()));
+        const auto workers = std::max<size_t>(1, std::min<size_t>(8, search_files.size()));
         std::vector<std::thread> threads;
         for (size_t w = 0; w < workers; ++w) {
             threads.emplace_back([&, w] {
                 (void)w;
                 while (true) {
                     const auto i = next.fetch_add(1);
-                    if (i >= files.size()) break;
-                    auto entry = ensure_search_entry(files[i]);
-                    auto hits = search_snippets(cfg, files[i], entry, query, qlower);
+                    if (i >= search_files.size()) break;
+                    auto entry = ensure_search_entry(search_files[i]);
+                    auto hits = search_snippets(cfg, search_files[i], entry, query, qlower);
                     if (!hits.empty()) {
-                        result_items[i] = {{"project", files[i].project}, {"sid", files[i].sid}, {"mtime", files[i].mtime}, {"hits", hits}};
+                        result_items[i] = {{"project", search_files[i].project}, {"sid", search_files[i].sid}, {"mtime", search_files[i].mtime}, {"hits", hits}};
                     }
                 }
             });
@@ -2300,7 +2699,7 @@ void register_routes(httplib::Server& svr, const Config& cfg) {
             return (a["mtime"].is_number() ? a["mtime"].get<double>() : 0.0) >
                    (b["mtime"].is_number() ? b["mtime"].get<double>() : 0.0);
         });
-        json_response(res, {{"results", results}});
+        json_response(res, {{"results", results}, {"searched", search_files.size()}, {"total", files.size()}});
     });
 
     svr.Get(R"(/api/export/([^/]+)/([^/]+))", [&](const httplib::Request& req, httplib::Response& res) {
