@@ -247,17 +247,56 @@ const SettingsView = ({
 }) => {
   const [section, setSection] = React.useState('appearance');
   const [proxyDraft, setProxyDraft] = React.useState(managerSettings.proxyUrl || '');
+  const [mcpState, setMcpState] = React.useState({ loading: false, error: '', servers: [], configPath: '' });
+  const [mcpBusy, setMcpBusy] = React.useState('');
   React.useEffect(() => {
     setProxyDraft(managerSettings.proxyUrl || '');
   }, [managerSettings.proxyUrl]);
   const saveProxy = () => setManagerSettings({ proxyUrl: proxyDraft.trim() });
-  const Toggle = ({ on, onChange }) => (
+  const loadMcp = React.useCallback(() => {
+    setMcpState(s => ({ ...s, loading: true, error: '' }));
+    fetch('/api/mcp')
+      .then(r => r.json().then(d => ({ ok: r.ok, body: d })))
+      .then(({ ok, body }) => {
+        if (!ok || body.ok === false) throw new Error(body.error || '加载 MCP 配置失败');
+        setMcpState({ loading: false, error: '', servers: body.servers || [], configPath: body.configPath || '' });
+      })
+      .catch(e => setMcpState(s => ({ ...s, loading: false, error: String(e.message || e) })));
+  }, []);
+  React.useEffect(() => {
+    if (section === 'mcp') loadMcp();
+  }, [section, loadMcp]);
+  const toggleMcp = (name, enabled) => {
+    setMcpBusy(name);
+    setMcpState(s => ({
+      ...s,
+      error: '',
+      servers: s.servers.map(m => m.name === name ? { ...m, enabled } : m)
+    }));
+    fetch('/api/mcp/toggle', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, enabled })
+    })
+      .then(r => r.json().then(d => ({ ok: r.ok, body: d })))
+      .then(({ ok, body }) => {
+        if (!ok || body.ok === false) throw new Error(body.error || '更新 MCP 配置失败');
+        setMcpState({ loading: false, error: '', servers: body.servers || [], configPath: body.configPath || '' });
+      })
+      .catch(e => {
+        setMcpState(s => ({ ...s, error: String(e.message || e) }));
+        loadMcp();
+      })
+      .finally(() => setMcpBusy(''));
+  };
+  const Toggle = ({ on, onChange, disabled = false }) => (
     <div
-      className={`toggle ${on ? 'on' : ''}`}
-      onClick={() => onChange(!on)}
-      style={{ cursor: 'pointer' }}
+      className={`toggle ${on ? 'on' : ''} ${disabled ? 'disabled' : ''}`}
+      onClick={() => { if (!disabled) onChange(!on); }}
+      style={{ cursor: disabled ? 'default' : 'pointer' }}
       role="switch"
       aria-checked={!!on}
+      aria-disabled={!!disabled}
     />
   );
   return (
@@ -275,6 +314,7 @@ const SettingsView = ({
             { id: 'appearance', label: '外观' },
             { id: 'general',    label: '通用' },
             { id: 'network',    label: '网络' },
+            { id: 'mcp',        label: 'MCP 管理' },
             { id: 'shortcuts',  label: '快捷键' },
             { id: 'export',     label: '导出与备份' },
             { id: 'account',    label: '账户' },
@@ -409,6 +449,56 @@ const SettingsView = ({
                   <button className="chip-btn" onClick={() => { setProxyDraft(''); setManagerSettings({ proxyUrl: '' }); }}>清空</button>
                 </div>
               </div>
+            </div>
+          )}
+
+          {section === 'mcp' && (
+            <div className="settings-group">
+              <div className="settings-group-head">
+                <h3>MCP 管理</h3>
+                <p>{mcpState.configPath || '本地 MCP 配置'}</p>
+              </div>
+              {mcpState.loading && (
+                <div className="setting-row">
+                  <div className="setting-label">
+                    <div className="name">加载中...</div>
+                  </div>
+                </div>
+              )}
+              {mcpState.error && (
+                <div className="setting-row">
+                  <div className="setting-label">
+                    <div className="name" style={{color: 'var(--danger, #ef4444)'}}>加载失败</div>
+                    <div className="desc">{mcpState.error}</div>
+                  </div>
+                  <button className="chip-btn" onClick={loadMcp}>重试</button>
+                </div>
+              )}
+              {!mcpState.loading && !mcpState.error && mcpState.servers.length === 0 && (
+                <div className="setting-row">
+                  <div className="setting-label">
+                    <div className="name">未找到 MCP server</div>
+                    <div className="desc">当前配置文件里没有全局 MCP server。</div>
+                  </div>
+                </div>
+              )}
+              {!mcpState.loading && mcpState.servers.map(server => (
+                <div key={server.name} className="setting-row mcp-row">
+                  <div className="setting-label">
+                    <div className="name mcp-name">
+                      <span>{server.name}</span>
+                      <span className={`mcp-pill ${server.enabled ? 'on' : ''}`}>{server.enabled ? '启用' : '停用'}</span>
+                      <span className="mcp-pill">{server.type || 'stdio'}</span>
+                    </div>
+                    <div className="desc mcp-target">{server.url || server.command || server.source}</div>
+                  </div>
+                  <Toggle
+                    on={!!server.enabled}
+                    disabled={!!mcpBusy}
+                    onChange={(v) => toggleMcp(server.name, v)}
+                  />
+                </div>
+              ))}
             </div>
           )}
 
