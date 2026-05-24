@@ -126,6 +126,7 @@ const SearchView = ({ data, query, setQuery, onOpen }) => {
 
   React.useEffect(() => {
     if (!q || q.length < 2) { setDeepHits({}); return; }
+    setDeepHits({});
     const ctrl = new AbortController();
     const t = setTimeout(() => {
       fetch('/api/search?q=' + encodeURIComponent(q), {signal: ctrl.signal})
@@ -135,14 +136,14 @@ const SearchView = ({ data, query, setQuery, onOpen }) => {
           for (const r of d.results) by[r.project + '|' + r.sid] = r.hits;
           setDeepHits(by);
         }).catch(() => {});
-    }, 200);
+    }, 300);
     return () => { clearTimeout(t); ctrl.abort(); };
   }, [q]);
 
   const results = q
     ? conversations.filter(c =>
-        c.title.toLowerCase().includes(ql) ||
-        c.snippet.toLowerCase().includes(ql) ||
+        (c.searchTitle || c.title.toLowerCase()).includes(ql) ||
+        (c.searchSnippet || c.snippet.toLowerCase()).includes(ql) ||
         deepHits[c.id]
       ).sort((a,b) => b.updatedSort - a.updatedSort)
     : [];
