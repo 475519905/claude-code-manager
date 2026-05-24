@@ -203,7 +203,6 @@ const ConversationView = ({ conv, data, onBack, onDeleted, onTagsChanged, onPick
         method: 'POST'
       });
       const d = await r.json().catch(() => ({}));
-      if (await window.handleAuthGate(d)) return;
       if (!r.ok || !d.ok) {
         window.dialog.alert('生成失败: ' + (d.error || `HTTP ${r.status}`), {title:'生成 Skill 失败', danger:true});
         return;
@@ -220,7 +219,6 @@ const ConversationView = ({ conv, data, onBack, onDeleted, onTagsChanged, onPick
       const r = await fetch('/api/resume', {method:'POST', headers:{'Content-Type':'application/json'},
         body: JSON.stringify({project: conv.project, sid: conv.sid})});
       const d = await r.json();
-      if (await window.handleAuthGate(d)) return;
       if (!d.ok) window.dialog.alert('启动失败: ' + (d.error || '未知'), {title:'启动失败', danger:true});
     } catch (e) { window.dialog.alert('启动失败: ' + e, {title:'启动失败', danger:true}); }
   };
@@ -229,7 +227,6 @@ const ConversationView = ({ conv, data, onBack, onDeleted, onTagsChanged, onPick
       const r = await fetch('/api/claude', {method:'POST', headers:{'Content-Type':'application/json'},
         body: JSON.stringify({project: conv.project, sid: conv.sid})});
       const d = await r.json();
-      if (await window.handleAuthGate(d)) return;
       if (!d.ok) window.dialog.alert('启动失败: ' + (d.error || '未知'), {title:'启动失败', danger:true});
     } catch (e) { window.dialog.alert('启动失败: ' + e, {title:'启动失败', danger:true}); }
   };

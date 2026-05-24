@@ -304,7 +304,7 @@ const SettingsView = ({
       <div className="page-header">
         <div>
           <h1 className="page-title">设置</h1>
-          <p className="page-sub">管理你的偏好、导出与账户设置</p>
+          <p className="page-sub">管理你的偏好、网络、MCP 与导出设置</p>
         </div>
       </div>
 
@@ -317,7 +317,6 @@ const SettingsView = ({
             { id: 'mcp',        label: 'MCP 管理' },
             { id: 'shortcuts',  label: '快捷键' },
             { id: 'export',     label: '导出与备份' },
-            { id: 'account',    label: '账户' },
           ].map(s => (
             <div
               key={s.id}
@@ -546,37 +545,6 @@ const SettingsView = ({
                   <button className="chip-btn">{i === 3 ? '开启' : '导出'}</button>
                 </div>
               ))}
-            </div>
-          )}
-
-          {section === 'account' && (
-            <div className="settings-group">
-              <div className="settings-group-head">
-                <h3>账户</h3>
-              </div>
-              <div className="setting-row">
-                <div className="setting-label" style={{display: 'flex', alignItems: 'center', gap: 14}}>
-                  <div className="avatar" style={{width: 44, height: 44, fontSize: 15}}>L</div>
-                  <div>
-                    <div className="name">Local User</div>
-                    <div className="desc" style={{fontFamily: 'var(--font-mono)'}}>local account</div>
-                  </div>
-                </div>
-                <button className="chip-btn">编辑</button>
-              </div>
-              <div className="setting-row">
-                <div className="setting-label">
-                  <div className="name">订阅方案</div>
-                  <div className="desc">Pro · 下次续费 2026-05-12</div>
-                </div>
-                <button className="chip-btn">管理订阅</button>
-              </div>
-              <div className="setting-row">
-                <div className="setting-label">
-                  <div className="name" style={{color: 'oklch(55% 0.14 25)'}}>退出登录</div>
-                </div>
-                <button className="chip-btn">退出</button>
-              </div>
             </div>
           )}
         </div>

@@ -3432,23 +3432,6 @@ Candidate restore_codex_session_if_needed(const Config& cfg, Candidate c) {
     return c;
 }
 
-json read_json_file(const fs::path& path) {
-    std::string body;
-    if (!read_file(path, body)) return json::object();
-    auto data = json::parse(body, nullptr, false);
-    return data.is_object() ? data : json::object();
-}
-
-json auth_status(const Config& cfg) {
-    (void)cfg;
-    return {
-        {"ok", true},
-        {"reason", "privacy_disabled"},
-        {"expiresInSec", nullptr},
-        {"privacyMode", true}
-    };
-}
-
 void launch_new_chat(const Config& cfg) {
     const auto cli_name = cfg.is_codex ? "codex" : "claude";
     if (auto cli = find_cli(cfg, cli_name)) {
@@ -3463,28 +3446,6 @@ void launch_new_chat(const Config& cfg) {
 #endif
     }
     throw std::runtime_error(cli_name + std::string(" CLI not found"));
-}
-
-void launch_login(const Config& cfg, const std::string& cli_name) {
-    auto cli = find_cli(cfg, cli_name);
-    if (!cli) throw std::runtime_error(cli_name + std::string(" CLI not found"));
-    const auto arg = cli_name == "claude" ? "/login" : "login";
-    spawn_terminal(cfg, cfg.home, cli_command(*cli, {arg}), cli_name == "claude" ? "Claude Login" : "Codex Login");
-}
-
-json account_payload(const Config& cfg) {
-    auto auth = auth_status(cfg);
-    if (cfg.is_codex) {
-        return {{"name", "Codex"}, {"email", "local Codex"}, {"auth", auth}};
-    }
-    return {
-        {"ok", true},
-        {"name", "Claude"},
-        {"email", "local Claude"},
-        {"plan", "-"},
-        {"tier", ""},
-        {"auth", auth}
-    };
 }
 
 Config make_config(int argc, char** argv) {
@@ -3759,14 +3720,6 @@ void register_routes(httplib::Server& svr, const Config& cfg) {
         json_response(res, {{"ok", true}});
     });
 
-    svr.Get("/api/account", [&](const httplib::Request&, httplib::Response& res) {
-        json_response(res, account_payload(cfg));
-    });
-
-    svr.Get("/api/auth-status", [&](const httplib::Request&, httplib::Response& res) {
-        json_response(res, auth_status(cfg));
-    });
-
     svr.Get("/api/settings", [&](const httplib::Request&, httplib::Response& res) {
         json_response(res, {{"ok", true}, {"settings", load_manager_settings(cfg)}});
     });
@@ -3804,12 +3757,6 @@ void register_routes(httplib::Server& svr, const Config& cfg) {
             error_response(res, 500, e.what());
         }
     });
-
-    auto login_stub = [](const httplib::Request&, httplib::Response& res) {
-        json_response(res, {{"ok", false}, {"error", "login is intentionally disabled in the desktop client"}}, 501);
-    };
-    svr.Post("/api/codex-login", login_stub);
-    svr.Post("/api/claude-login", login_stub);
 
     svr.Post("/api/resume", [&](const httplib::Request& req, httplib::Response& res) {
         const auto data = parse_json_body(req);

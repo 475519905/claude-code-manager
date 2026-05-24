@@ -1,19 +1,9 @@
 // Sidebar component
 const Sidebar = ({ view, setView, selectedProject, setSelectedProject, selectedTag, setSelectedTag, data, counts }) => {
-  const [account, setAccount] = React.useState(null);
   const profile = {
-    name: account?.name || 'Codex',
-    email: account?.email || 'local Codex',
+    name: 'Codex',
+    email: 'local Codex',
   };
-  const loadAccount = () =>
-    fetch('/api/account').then(r => r.json()).then(setAccount).catch(() => {});
-  React.useEffect(() => {
-    loadAccount();
-    // Re-poll every 60s so the expiry warning appears/disappears on its own.
-    const h = setInterval(loadAccount, 60000);
-    return () => clearInterval(h);
-  }, []);
-  const authBad = account && account.auth && !account.auth.ok;
   const [newChatBusy, setNewChatBusy] = React.useState(false);
   const onNewChat = React.useCallback(async () => {
     if (newChatBusy) return;
@@ -30,22 +20,6 @@ const Sidebar = ({ view, setView, selectedProject, setSelectedProject, selectedT
       setTimeout(() => setNewChatBusy(false), 1500);
     }
   }, [newChatBusy]);
-  const onRelogin = async () => {
-    try {
-      const r = await fetch('/api/codex-login', {method:'POST'});
-      const d = await r.json();
-      if (d.ok) {
-        await window.dialog.alert(
-          '已打开终端窗口。完成 `codex login` 后,点击刷新数据即可。',
-          {title:'请在新终端中完成登录'});
-      } else {
-        await window.dialog.alert('启动登录失败: ' + (d.error || '未知'),
-          {title:'启动失败', danger:true});
-      }
-    } catch (e) {
-      await window.dialog.alert('启动登录失败: ' + e, {title:'启动失败', danger:true});
-    }
-  };
   const navItems = [
     { id: 'all',     label: '所有对话', icon: 'message',  count: counts.all },
     { id: 'pinned',  label: '置顶',     icon: 'pin',      count: counts.pinned },
@@ -53,13 +27,6 @@ const Sidebar = ({ view, setView, selectedProject, setSelectedProject, selectedT
     { id: 'archive', label: '归档',     icon: 'archive',  count: counts.archive },
     { id: 'costs',   label: '用量',     icon: 'sparkles' },
   ];
-
-  const go = (v, extra = {}) => {
-    setView(v);
-    if (!extra.keepProject) setSelectedProject(null);
-    if (!extra.keepTag) setSelectedTag(null);
-    Object.assign(window.__appState || {}, extra);
-  };
 
   return (
     <aside className="sidebar">
@@ -139,14 +106,8 @@ const Sidebar = ({ view, setView, selectedProject, setSelectedProject, selectedT
         <div className="avatar">{profile.name.charAt(0)}</div>
         <div className="user-meta">
           <div className="user-name" title={profile.email}>{profile.name}</div>
-          <div className="user-plan">{account?.plan || 'Codex'}{account?.tier ? ` · ${account.tier}` : ''}</div>
-          {authBad ? (
-            <button className="auth-warn" onClick={onRelogin} title={account?.auth?.reason || ''}>
-              ⚠ Codex 登录需要刷新 · 点此重登
-            </button>
-          ) : (
-            <div className="user-email" title={profile.email}>{profile.email}</div>
-          )}
+          <div className="user-plan">Codex</div>
+          <div className="user-email" title={profile.email}>{profile.email}</div>
         </div>
       </div>
     </aside>
