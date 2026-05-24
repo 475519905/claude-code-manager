@@ -123,6 +123,24 @@ struct SearchIndexEntry {
     std::vector<std::uint64_t> token_bloom;
 };
 
+struct SearchPostingIndex {
+    std::uint64_t generation = 0;
+    std::vector<std::string> session_keys;
+    std::unordered_map<std::string, std::uint32_t> session_ids;
+    std::unordered_map<std::uint32_t, std::vector<std::uint32_t>> gram_postings;
+};
+
+struct SearchCatalogSession {
+    std::string key;
+    std::string project;
+    std::string sid;
+    std::string storage;
+    std::string path;
+    double mtime = 0.0;
+    std::uintmax_t size = 0;
+    std::uint32_t flags = 0;
+};
+
 struct DetailEntry {
     double mtime = 0.0;
     std::uintmax_t size = 0;
@@ -138,7 +156,15 @@ std::vector<Candidate> g_candidate_cache;
 std::atomic_bool g_search_warmup_running{false};
 std::unordered_map<std::string, std::shared_ptr<SearchEntry>> g_search_blobs;
 std::unordered_map<std::string, SearchIndexEntry> g_search_index_cache;
+std::uint64_t g_search_index_cache_generation = 0;
+std::shared_ptr<SearchPostingIndex> g_search_posting_index;
+std::vector<SearchCatalogSession> g_search_catalog_sessions;
 bool g_search_catalog_loaded = false;
+std::atomic_uint64_t g_search_index_full_builds{0};
+std::atomic_uint64_t g_search_index_incremental_updates{0};
+std::atomic_uint64_t g_search_index_rebuilds{0};
+std::atomic_uint64_t g_search_generation{0};
+std::atomic_uint64_t g_search_cancelled{0};
 std::unordered_map<std::string, DetailEntry> g_detail_cache;
 std::optional<json> g_index_cache;
 
@@ -871,6 +897,351 @@ void save_manager_settings(const Config& cfg, const json& settings) {
     }
 }
 
+bool write_text_atomic(const fs::path& path, const std::string& text) {
+    try {
+        fs::create_directories(path.parent_path());
+        const auto tmp = path.string() + ".tmp";
+        {
+            std::ofstream out(tmp, std::ios::binary);
+            out << text;
+            if (!out) return false;
+        }
+        std::error_code ec;
+        fs::rename(tmp, path, ec);
+        if (ec) {
+            fs::remove(path, ec);
+            fs::rename(tmp, path, ec);
+        }
+        return !ec;
+    } catch (...) {
+        return false;
+    }
+}
+
+void backup_config_file(const fs::path& path) {
+    try {
+        if (!fs::is_regular_file(path)) return;
+        std::error_code ec;
+        fs::copy_file(path, path.string() + ".bak", fs::copy_options::overwrite_existing, ec);
+    } catch (...) {
+    }
+}
+
+fs::path codex_mcp_config_path(const Config& cfg) {
+    return cfg.codex_home / "config.toml";
+}
+
+fs::path claude_mcp_config_path(const Config& cfg) {
+    return cfg.home / ".claude.json";
+}
+
+struct CodexMcpMarker {
+    bool marked = false;
+    std::string name;
+    std::string content;
+};
+
+CodexMcpMarker parse_codex_mcp_marker(const std::string& line) {
+    const std::string prefix = "# CM_DISABLED_MCP ";
+    if (!starts_with(line, prefix)) return {};
+    const auto rest = line.substr(prefix.size());
+    const auto split = rest.find(' ');
+    if (split == std::string::npos || split == 0) return {};
+    return {true, rest.substr(0, split), rest.substr(split + 1)};
+}
+
+std::string strip_utf8_bom(std::string s) {
+    if (s.size() >= 3 &&
+        static_cast<unsigned char>(s[0]) == 0xEF &&
+        static_cast<unsigned char>(s[1]) == 0xBB &&
+        static_cast<unsigned char>(s[2]) == 0xBF) {
+        s.erase(0, 3);
+    }
+    return s;
+}
+
+bool is_toml_section_header(const std::string& line) {
+    const auto s = strip_utf8_bom(trim(line));
+    return s.size() >= 2 && s.front() == '[' && s.back() == ']';
+}
+
+std::optional<std::pair<std::string, bool>> parse_codex_mcp_section(const std::string& line) {
+    auto s = strip_utf8_bom(trim(line));
+    if (s.size() < 3 || s.front() != '[' || s.back() != ']') return std::nullopt;
+    s = s.substr(1, s.size() - 2);
+    const std::string prefix = "mcp_servers.";
+    if (!starts_with(s, prefix)) return std::nullopt;
+    auto rest = s.substr(prefix.size());
+    if (rest.empty()) return std::nullopt;
+    const auto dot = rest.find('.');
+    const auto name = dot == std::string::npos ? rest : rest.substr(0, dot);
+    if (name.empty()) return std::nullopt;
+    return std::make_pair(name, dot != std::string::npos);
+}
+
+std::string parse_toml_string_value(const std::string& line, const std::string& key) {
+    auto s = strip_utf8_bom(trim(line));
+    const auto eq = s.find('=');
+    if (eq == std::string::npos) return "";
+    if (trim(s.substr(0, eq)) != key) return "";
+    s = trim(s.substr(eq + 1));
+    if (s.empty()) return "";
+    const char quote = s.front();
+    if (quote != '"' && quote != '\'') return "";
+    std::string out;
+    bool escaped = false;
+    for (size_t i = 1; i < s.size(); ++i) {
+        const char ch = s[i];
+        if (escaped) {
+            out.push_back(ch);
+            escaped = false;
+            continue;
+        }
+        if (quote == '"' && ch == '\\') {
+            escaped = true;
+            continue;
+        }
+        if (ch == quote) break;
+        out.push_back(ch);
+    }
+    return out;
+}
+
+void add_mcp_server_json(json& by_name, const std::string& name, bool enabled, const std::string& source, const std::string& config_path) {
+    if (name.empty()) return;
+    auto& item = by_name[name];
+    if (!item.is_object()) item = json::object();
+    item["name"] = name;
+    item["enabled"] = enabled;
+    item["source"] = source;
+    item["configPath"] = config_path;
+}
+
+json list_codex_mcp_servers(const Config& cfg) {
+    const auto path = codex_mcp_config_path(cfg);
+    json by_name = json::object();
+    std::string text;
+    if (!read_file(path, text)) {
+        return {{"ok", true}, {"kind", cfg.kind}, {"configPath", path_string(path)}, {"servers", json::array()}};
+    }
+    text = strip_utf8_bom(text);
+
+    std::istringstream in(text);
+    std::string line;
+    std::string active_name, disabled_name;
+    while (std::getline(in, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        const auto marker = parse_codex_mcp_marker(line);
+        if (marker.marked) {
+            if (auto section = parse_codex_mcp_section(marker.content)) {
+                disabled_name = section->first;
+                add_mcp_server_json(by_name, disabled_name, false, "codex", path_string(path));
+                by_name[disabled_name]["type"] = "stdio";
+            } else if (is_toml_section_header(marker.content)) {
+                disabled_name.clear();
+            } else if (!disabled_name.empty()) {
+                auto url = parse_toml_string_value(marker.content, "url");
+                auto command = parse_toml_string_value(marker.content, "command");
+                if (!url.empty()) {
+                    by_name[disabled_name]["type"] = "http";
+                    by_name[disabled_name]["url"] = url;
+                }
+                if (!command.empty()) {
+                    by_name[disabled_name]["type"] = "stdio";
+                    by_name[disabled_name]["command"] = command;
+                }
+            }
+            continue;
+        }
+
+        if (auto section = parse_codex_mcp_section(line)) {
+            active_name = section->first;
+            add_mcp_server_json(by_name, active_name, true, "codex", path_string(path));
+            by_name[active_name]["type"] = "stdio";
+            continue;
+        } else if (is_toml_section_header(line)) {
+            active_name.clear();
+            continue;
+        }
+        if (!active_name.empty()) {
+            auto url = parse_toml_string_value(line, "url");
+            auto command = parse_toml_string_value(line, "command");
+            if (!url.empty()) {
+                by_name[active_name]["type"] = "http";
+                by_name[active_name]["url"] = url;
+            }
+            if (!command.empty()) {
+                by_name[active_name]["type"] = "stdio";
+                by_name[active_name]["command"] = command;
+            }
+        }
+    }
+
+    json servers = json::array();
+    for (auto it = by_name.begin(); it != by_name.end(); ++it) servers.push_back(it.value());
+    std::sort(servers.begin(), servers.end(), [](const json& a, const json& b) {
+        return lower_ascii(field_string(a, "name")) < lower_ascii(field_string(b, "name"));
+    });
+    return {{"ok", true}, {"kind", cfg.kind}, {"configPath", path_string(path)}, {"servers", servers}};
+}
+
+bool set_codex_mcp_enabled(const Config& cfg, const std::string& name, bool enabled, std::string& error) {
+    const auto path = codex_mcp_config_path(cfg);
+    std::string text;
+    if (!read_file(path, text)) {
+        error = "Codex config.toml not found";
+        return false;
+    }
+    text = strip_utf8_bom(text);
+    const std::string marker_prefix = "# CM_DISABLED_MCP " + name + " ";
+    std::istringstream in(text);
+    std::ostringstream out;
+    std::string line;
+    bool changed = false;
+    bool in_target = false;
+    bool found = false;
+    while (std::getline(in, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        const auto marker = parse_codex_mcp_marker(line);
+        if (enabled && marker.marked && marker.name == name) {
+            out << marker.content << "\n";
+            changed = true;
+            found = true;
+            continue;
+        }
+        if (!marker.marked) {
+            if (auto section = parse_codex_mcp_section(line)) {
+                in_target = section->first == name;
+                if (in_target) found = true;
+            } else if (is_toml_section_header(line)) {
+                in_target = false;
+            }
+            if (!enabled && in_target) {
+                out << marker_prefix << line << "\n";
+                changed = true;
+                continue;
+            }
+        }
+        out << line << "\n";
+    }
+    if (!found) {
+        error = "MCP server not found";
+        return false;
+    }
+    if (!changed) return true;
+    backup_config_file(path);
+    if (!write_text_atomic(path, out.str())) {
+        error = "failed to write Codex config";
+        return false;
+    }
+    return true;
+}
+
+json mcp_server_summary_from_json(const std::string& name, const json& value, bool enabled, const std::string& source, const std::string& config_path) {
+    json item = {{"name", name}, {"enabled", enabled}, {"source", source}, {"configPath", config_path}, {"type", "stdio"}};
+    if (value.is_object()) {
+        const auto url = field_string(value, "url");
+        const auto command = field_string(value, "command");
+        if (!url.empty()) {
+            item["type"] = "http";
+            item["url"] = url;
+        }
+        if (!command.empty()) {
+            item["type"] = "stdio";
+            item["command"] = command;
+        }
+    }
+    return item;
+}
+
+json list_claude_mcp_servers(const Config& cfg) {
+    const auto path = claude_mcp_config_path(cfg);
+    std::string text;
+    if (!read_file(path, text)) {
+        return {{"ok", true}, {"kind", cfg.kind}, {"configPath", path_string(path)}, {"servers", json::array()}};
+    }
+    auto data = json::parse(text, nullptr, false);
+    if (!data.is_object()) {
+        return {{"ok", false}, {"error", "invalid Claude JSON config"}, {"configPath", path_string(path)}, {"servers", json::array()}};
+    }
+    json by_name = json::object();
+    const auto config_path = path_string(path);
+    if (data.contains("mcpServers") && data["mcpServers"].is_object()) {
+        for (auto it = data["mcpServers"].begin(); it != data["mcpServers"].end(); ++it) {
+            by_name[it.key()] = mcp_server_summary_from_json(it.key(), it.value(), true, "claude", config_path);
+        }
+    }
+    if (data.contains("managerDisabledMcpServers") && data["managerDisabledMcpServers"].is_object()) {
+        for (auto it = data["managerDisabledMcpServers"].begin(); it != data["managerDisabledMcpServers"].end(); ++it) {
+            if (!by_name.contains(it.key())) by_name[it.key()] = mcp_server_summary_from_json(it.key(), it.value(), false, "claude", config_path);
+        }
+    }
+    json servers = json::array();
+    for (auto it = by_name.begin(); it != by_name.end(); ++it) servers.push_back(it.value());
+    std::sort(servers.begin(), servers.end(), [](const json& a, const json& b) {
+        return lower_ascii(field_string(a, "name")) < lower_ascii(field_string(b, "name"));
+    });
+    return {{"ok", true}, {"kind", cfg.kind}, {"configPath", config_path}, {"servers", servers}};
+}
+
+bool set_claude_mcp_enabled(const Config& cfg, const std::string& name, bool enabled, std::string& error) {
+    const auto path = claude_mcp_config_path(cfg);
+    std::string text;
+    if (!read_file(path, text)) {
+        error = "Claude config not found";
+        return false;
+    }
+    auto data = json::parse(text, nullptr, false);
+    if (!data.is_object()) {
+        error = "invalid Claude JSON config";
+        return false;
+    }
+    if (!data.contains("mcpServers") || !data["mcpServers"].is_object()) data["mcpServers"] = json::object();
+    if (!data.contains("managerDisabledMcpServers") || !data["managerDisabledMcpServers"].is_object()) data["managerDisabledMcpServers"] = json::object();
+    auto& active = data["mcpServers"];
+    auto& disabled = data["managerDisabledMcpServers"];
+    bool changed = false;
+    if (enabled) {
+        if (disabled.contains(name)) {
+            if (!active.contains(name)) active[name] = disabled[name];
+            disabled.erase(name);
+            changed = true;
+        } else if (!active.contains(name)) {
+            error = "MCP server not found";
+            return false;
+        }
+    } else {
+        if (active.contains(name)) {
+            disabled[name] = active[name];
+            active.erase(name);
+            changed = true;
+        } else if (!disabled.contains(name)) {
+            error = "MCP server not found";
+            return false;
+        }
+    }
+    if (!changed) return true;
+    backup_config_file(path);
+    if (!write_text_atomic(path, data.dump(2))) {
+        error = "failed to write Claude config";
+        return false;
+    }
+    return true;
+}
+
+json list_mcp_servers(const Config& cfg) {
+    return cfg.is_codex ? list_codex_mcp_servers(cfg) : list_claude_mcp_servers(cfg);
+}
+
+bool set_mcp_enabled(const Config& cfg, const std::string& name, bool enabled, std::string& error) {
+    if (name.empty() || name.find('\n') != std::string::npos || name.find('\r') != std::string::npos) {
+        error = "invalid MCP server name";
+        return false;
+    }
+    return cfg.is_codex ? set_codex_mcp_enabled(cfg, name, enabled, error)
+                        : set_claude_mcp_enabled(cfg, name, enabled, error);
+}
+
 std::vector<Candidate> enumerate_claude_files(const Config& cfg) {
     std::vector<Candidate> out;
     if (!fs::is_directory(cfg.claude_projects)) return out;
@@ -1357,6 +1728,18 @@ fs::path search_index_catalog_path(const Config& cfg) {
     return cfg.search_index_dir / "catalog.bin";
 }
 
+SearchCatalogSession make_search_catalog_session(const Candidate& c) {
+    SearchCatalogSession session;
+    session.key = relative_key(c);
+    session.project = c.project;
+    session.sid = c.sid;
+    session.storage = c.storage;
+    session.path = path_string(c.path);
+    session.mtime = c.mtime;
+    session.size = c.size;
+    return session;
+}
+
 template <typename T>
 bool write_scalar(std::ofstream& out, const T& value) {
     out.write(reinterpret_cast<const char*>(&value), sizeof(T));
@@ -1367,6 +1750,57 @@ template <typename T>
 bool read_scalar(std::ifstream& in, T& value) {
     in.read(reinterpret_cast<char*>(&value), sizeof(T));
     return static_cast<bool>(in);
+}
+
+bool write_blob(std::ofstream& out, const std::string& value) {
+    const std::uint32_t size = static_cast<std::uint32_t>(value.size());
+    if (!write_scalar(out, size)) return false;
+    out.write(value.data(), static_cast<std::streamsize>(value.size()));
+    return static_cast<bool>(out);
+}
+
+bool read_blob(std::ifstream& in, std::string& value, std::uint32_t max_size = 1u << 20) {
+    std::uint32_t size = 0;
+    if (!read_scalar(in, size) || size > max_size) return false;
+    value.assign(size, '\0');
+    in.read(value.data(), static_cast<std::streamsize>(size));
+    return static_cast<bool>(in);
+}
+
+bool write_search_catalog_session(std::ofstream& out, const SearchCatalogSession& session) {
+    const std::uint64_t size = static_cast<std::uint64_t>(session.size);
+    if (!write_scalar(out, size) || !write_scalar(out, session.mtime) ||
+        !write_scalar(out, session.flags)) {
+        return false;
+    }
+    return write_blob(out, session.key) &&
+           write_blob(out, session.project) &&
+           write_blob(out, session.sid) &&
+           write_blob(out, session.storage) &&
+           write_blob(out, session.path);
+}
+
+bool read_search_catalog_session(std::ifstream& in, SearchCatalogSession& session) {
+    std::uint64_t size = 0;
+    double mtime = 0.0;
+    std::uint32_t flags = 0;
+    if (!read_scalar(in, size) || !read_scalar(in, mtime) ||
+        !read_scalar(in, flags)) {
+        return false;
+    }
+    SearchCatalogSession loaded;
+    loaded.size = static_cast<std::uintmax_t>(size);
+    loaded.mtime = mtime;
+    loaded.flags = flags;
+    if (!read_blob(in, loaded.key, 4096) ||
+        !read_blob(in, loaded.project, 4096) ||
+        !read_blob(in, loaded.sid, 4096) ||
+        !read_blob(in, loaded.storage, 1024) ||
+        !read_blob(in, loaded.path, 1u << 20)) {
+        return false;
+    }
+    session = std::move(loaded);
+    return true;
 }
 
 bool write_search_index_payload(std::ofstream& out, const std::string& key, const SearchIndexEntry& entry) {
@@ -1501,6 +1935,196 @@ bool load_search_index_sidecar(const Config& cfg, const std::string& key, Search
     return stored_key == key;
 }
 
+bool search_index_entry_is_current(const SearchIndexEntry& entry, const Candidate& c) {
+    return entry.size == c.size &&
+           std::abs(entry.mtime - c.mtime) < 0.000001 &&
+           entry.token_bloom.size() == kSearchIndexTokenBloomWords;
+}
+
+bool search_index_may_contain(const SearchIndexEntry& entry, const std::vector<std::uint32_t>& query_keys, const std::vector<std::uint64_t>& query_token_keys);
+
+bool cached_search_index_entry(const std::string& key, SearchIndexEntry& entry) {
+    std::lock_guard<std::mutex> lock(g_index_mutex);
+    auto it = g_search_index_cache.find(key);
+    if (it == g_search_index_cache.end()) return false;
+    entry = it->second;
+    return true;
+}
+
+bool cached_search_index_entry_current(const std::string& key, const Candidate& c) {
+    std::lock_guard<std::mutex> lock(g_index_mutex);
+    auto it = g_search_index_cache.find(key);
+    return it != g_search_index_cache.end() && search_index_entry_is_current(it->second, c);
+}
+
+bool cached_search_index_may_contain_current(const std::string& key, const Candidate& c, const std::vector<std::uint32_t>& query_keys, const std::vector<std::uint64_t>& query_token_keys, bool& may_contain) {
+    std::lock_guard<std::mutex> lock(g_index_mutex);
+    auto it = g_search_index_cache.find(key);
+    if (it == g_search_index_cache.end() || !search_index_entry_is_current(it->second, c)) return false;
+    may_contain = search_index_may_contain(it->second, query_keys, query_token_keys);
+    return true;
+}
+
+bool load_current_search_index_entry(const Config& cfg, const std::string& key, const Candidate& c, SearchIndexEntry& entry) {
+    if (cached_search_index_entry(key, entry) && search_index_entry_is_current(entry, c)) return true;
+    if (!load_search_index_sidecar(cfg, key, entry) || !search_index_entry_is_current(entry, c)) return false;
+    {
+        std::lock_guard<std::mutex> lock(g_index_mutex);
+        g_search_index_cache[key] = entry;
+        ++g_search_index_cache_generation;
+    }
+    return true;
+}
+
+std::uint64_t search_index_cache_generation() {
+    std::lock_guard<std::mutex> lock(g_index_mutex);
+    return g_search_index_cache_generation;
+}
+
+std::shared_ptr<SearchPostingIndex> build_search_posting_index() {
+    std::vector<std::pair<std::string, std::vector<std::uint32_t>>> entries;
+    std::uint64_t generation = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_index_mutex);
+        generation = g_search_index_cache_generation;
+        entries.reserve(g_search_index_cache.size());
+        for (const auto& [key, entry] : g_search_index_cache) {
+            if (!entry.grams.empty()) entries.push_back({key, entry.grams});
+        }
+    }
+
+    auto index = std::make_shared<SearchPostingIndex>();
+    index->generation = generation;
+    index->session_keys.reserve(entries.size());
+    index->session_ids.reserve(entries.size());
+    for (const auto& [key, grams] : entries) {
+        const auto id = static_cast<std::uint32_t>(index->session_keys.size());
+        index->session_keys.push_back(key);
+        index->session_ids.emplace(key, id);
+        for (const auto gram : grams) {
+            index->gram_postings[gram].push_back(id);
+        }
+    }
+    return index;
+}
+
+std::shared_ptr<SearchPostingIndex> ensure_search_posting_index() {
+    {
+        std::lock_guard<std::mutex> lock(g_index_mutex);
+        if (g_search_posting_index && g_search_posting_index->generation == g_search_index_cache_generation) {
+            return g_search_posting_index;
+        }
+    }
+    auto rebuilt = build_search_posting_index();
+    std::lock_guard<std::mutex> lock(g_index_mutex);
+    if (!g_search_posting_index || g_search_posting_index->generation < rebuilt->generation) {
+        g_search_posting_index = rebuilt;
+    }
+    return g_search_posting_index;
+}
+
+std::unordered_set<std::string> search_posting_candidate_keys(const SearchPostingIndex& index, const std::vector<std::uint32_t>& query_keys) {
+    std::unordered_set<std::string> out;
+    if (query_keys.empty()) return out;
+    const std::vector<std::uint32_t>* smallest = nullptr;
+    for (const auto gram : query_keys) {
+        auto it = index.gram_postings.find(gram);
+        if (it == index.gram_postings.end()) return out;
+        if (!smallest || it->second.size() < smallest->size()) smallest = &it->second;
+    }
+    if (!smallest) return out;
+    out.reserve(smallest->size());
+    for (const auto id : *smallest) {
+        bool keep = true;
+        for (const auto gram : query_keys) {
+            const auto it = index.gram_postings.find(gram);
+            if (it == index.gram_postings.end() || !std::binary_search(it->second.begin(), it->second.end(), id)) {
+                keep = false;
+                break;
+            }
+        }
+        if (keep && id < index.session_keys.size()) out.insert(index.session_keys[id]);
+    }
+    return out;
+}
+
+void load_search_index_catalog_v6(std::ifstream& in, std::uint32_t entry_count) {
+    std::unordered_map<std::string, SearchIndexEntry> loaded;
+    std::vector<SearchCatalogSession> sessions;
+    loaded.reserve(entry_count);
+    sessions.reserve(entry_count);
+    for (std::uint32_t i = 0; i < entry_count; ++i) {
+        std::string key;
+        SearchIndexEntry entry;
+        if (!read_search_index_payload(in, key, entry)) return;
+        SearchCatalogSession session;
+        session.key = key;
+        session.size = entry.size;
+        session.mtime = entry.mtime;
+        session.flags = 1;
+        sessions.push_back(session);
+        loaded[std::move(key)] = std::move(entry);
+    }
+
+    std::lock_guard<std::mutex> lock(g_index_mutex);
+    for (auto& [key, entry] : loaded) {
+        g_search_index_cache[std::move(key)] = std::move(entry);
+    }
+    g_search_catalog_sessions = std::move(sessions);
+    if (!loaded.empty()) {
+        ++g_search_index_cache_generation;
+        g_search_posting_index.reset();
+    }
+}
+
+void load_search_index_catalog_v7(std::ifstream& in, std::uint32_t session_count) {
+    std::unordered_map<std::string, SearchIndexEntry> loaded;
+    std::vector<SearchCatalogSession> sessions;
+    auto postings = std::make_shared<SearchPostingIndex>();
+    loaded.reserve(session_count);
+    sessions.reserve(session_count);
+    postings->session_keys.reserve(session_count);
+    postings->session_ids.reserve(session_count);
+
+    for (std::uint32_t i = 0; i < session_count; ++i) {
+        SearchCatalogSession session;
+        if (!read_search_catalog_session(in, session) || session.key.empty()) return;
+        const auto id = static_cast<std::uint32_t>(postings->session_keys.size());
+        postings->session_keys.push_back(session.key);
+        postings->session_ids.emplace(session.key, id);
+        if ((session.flags & 1u) != 0) {
+            std::string key;
+            SearchIndexEntry entry;
+            if (!read_search_index_payload(in, key, entry) || key != session.key) return;
+            loaded[std::move(key)] = std::move(entry);
+        }
+        sessions.push_back(std::move(session));
+    }
+
+    std::uint32_t posting_count = 0;
+    if (!read_scalar(in, posting_count) || posting_count > (1u << 24)) return;
+    postings->gram_postings.reserve(posting_count);
+    for (std::uint32_t i = 0; i < posting_count; ++i) {
+        std::uint32_t gram = 0, count = 0;
+        if (!read_scalar(in, gram) || !read_scalar(in, count) || count > session_count) return;
+        auto& ids = postings->gram_postings[gram];
+        ids.resize(count);
+        if (count > 0) {
+            in.read(reinterpret_cast<char*>(ids.data()), static_cast<std::streamsize>(count * sizeof(std::uint32_t)));
+        }
+        if (!in || !std::is_sorted(ids.begin(), ids.end())) return;
+    }
+
+    std::lock_guard<std::mutex> lock(g_index_mutex);
+    for (auto& [key, entry] : loaded) {
+        g_search_index_cache[std::move(key)] = std::move(entry);
+    }
+    g_search_catalog_sessions = std::move(sessions);
+    ++g_search_index_cache_generation;
+    postings->generation = g_search_index_cache_generation;
+    g_search_posting_index = std::move(postings);
+}
+
 void load_search_index_catalog_once(const Config& cfg) {
     {
         std::lock_guard<std::mutex> lock(g_index_mutex);
@@ -1512,7 +2136,9 @@ void load_search_index_catalog_once(const Config& cfg) {
     if (!in) return;
     char magic[8]{};
     in.read(magic, sizeof(magic));
-    if (!in || std::string(magic, magic + 7) != "CMSCAT6") return;
+    if (!in) return;
+    const std::string magic_text(magic, magic + 7);
+    if (magic_text != "CMSCAT6" && magic_text != "CMSCAT7") return;
     std::uint32_t version = 0, gram_bytes = 0, token_gram_bytes = 0, bloom_bits = 0, bloom_probes = 0, entry_count = 0;
     if (!read_scalar(in, version) || !read_scalar(in, gram_bytes) ||
         !read_scalar(in, token_gram_bytes) || !read_scalar(in, bloom_bits) ||
@@ -1525,49 +2151,70 @@ void load_search_index_catalog_once(const Config& cfg) {
         return;
     }
 
-    std::unordered_map<std::string, SearchIndexEntry> loaded;
-    loaded.reserve(entry_count);
-    for (std::uint32_t i = 0; i < entry_count; ++i) {
-        std::string key;
-        SearchIndexEntry entry;
-        if (!read_search_index_payload(in, key, entry)) return;
-        loaded[std::move(key)] = std::move(entry);
-    }
-
-    std::lock_guard<std::mutex> lock(g_index_mutex);
-    for (auto& [key, entry] : loaded) {
-        g_search_index_cache[std::move(key)] = std::move(entry);
-    }
+    if (magic_text == "CMSCAT7") load_search_index_catalog_v7(in, entry_count);
+    else load_search_index_catalog_v6(in, entry_count);
 }
 
-bool save_search_index_catalog(const Config& cfg) {
+bool save_search_index_catalog(const Config& cfg, const std::vector<Candidate>& files) {
     try {
         fs::create_directories(cfg.search_index_dir);
         const auto path = search_index_catalog_path(cfg);
         const auto tmp = path.string() + ".tmp";
         std::ofstream out(tmp, std::ios::binary);
         if (!out) return false;
-        const char magic[8] = {'C', 'M', 'S', 'C', 'A', 'T', '6', '\0'};
+        const char magic[8] = {'C', 'M', 'S', 'C', 'A', 'T', '7', '\0'};
         out.write(magic, sizeof(magic));
         const std::uint32_t version = kSearchIndexVersion;
         const std::uint32_t gram_bytes = static_cast<std::uint32_t>(kSearchIndexMinGramQueryBytes);
         const std::uint32_t token_gram_bytes = static_cast<std::uint32_t>(kSearchIndexTokenGramBytes);
         const std::uint32_t bloom_bits = static_cast<std::uint32_t>(kSearchIndexTokenBloomBits);
         const std::uint32_t bloom_probes = static_cast<std::uint32_t>(kSearchIndexTokenBloomProbes);
-        std::vector<std::pair<std::string, SearchIndexEntry>> entries;
+        std::vector<SearchCatalogSession> sessions;
+        std::vector<std::optional<SearchIndexEntry>> entries;
+        auto postings = std::make_shared<SearchPostingIndex>();
+        std::uint64_t generation = 0;
         {
             std::lock_guard<std::mutex> lock(g_index_mutex);
-            entries.reserve(g_search_index_cache.size());
-            for (const auto& [key, entry] : g_search_index_cache) entries.push_back({key, entry});
+            generation = g_search_index_cache_generation;
+            sessions.reserve(files.size());
+            entries.reserve(files.size());
+            postings->session_keys.reserve(files.size());
+            postings->session_ids.reserve(files.size());
+            for (const auto& c : files) {
+                auto session = make_search_catalog_session(c);
+                const auto id = static_cast<std::uint32_t>(postings->session_keys.size());
+                postings->session_keys.push_back(session.key);
+                postings->session_ids.emplace(session.key, id);
+                std::optional<SearchIndexEntry> entry;
+                auto it = g_search_index_cache.find(session.key);
+                if (it != g_search_index_cache.end() && search_index_entry_is_current(it->second, c)) {
+                    session.flags |= 1u;
+                    entry = it->second;
+                    for (const auto gram : it->second.grams) postings->gram_postings[gram].push_back(id);
+                }
+                sessions.push_back(std::move(session));
+                entries.push_back(std::move(entry));
+            }
         }
-        const std::uint32_t entry_count = static_cast<std::uint32_t>(entries.size());
+        const std::uint32_t entry_count = static_cast<std::uint32_t>(sessions.size());
         if (!write_scalar(out, version) || !write_scalar(out, gram_bytes) ||
             !write_scalar(out, token_gram_bytes) || !write_scalar(out, bloom_bits) ||
             !write_scalar(out, bloom_probes) || !write_scalar(out, entry_count)) {
             return false;
         }
-        for (const auto& [key, entry] : entries) {
-            if (!write_search_index_payload(out, key, entry)) return false;
+        for (size_t i = 0; i < sessions.size(); ++i) {
+            if (!write_search_catalog_session(out, sessions[i])) return false;
+            if (entries[i] && !write_search_index_payload(out, sessions[i].key, *entries[i])) return false;
+        }
+        const std::uint32_t posting_count = static_cast<std::uint32_t>(postings->gram_postings.size());
+        if (!write_scalar(out, posting_count)) return false;
+        for (const auto& [gram, ids] : postings->gram_postings) {
+            const auto count = static_cast<std::uint32_t>(ids.size());
+            if (!write_scalar(out, gram) || !write_scalar(out, count)) return false;
+            if (!ids.empty()) {
+                out.write(reinterpret_cast<const char*>(ids.data()), static_cast<std::streamsize>(ids.size() * sizeof(std::uint32_t)));
+                if (!out) return false;
+            }
         }
         out.close();
         if (!out) return false;
@@ -1577,7 +2224,12 @@ bool save_search_index_catalog(const Config& cfg) {
             fs::remove(path, ec);
             fs::rename(tmp, path, ec);
         }
-        return !ec;
+        if (ec) return false;
+        std::lock_guard<std::mutex> lock(g_index_mutex);
+        postings->generation = generation;
+        g_search_catalog_sessions = std::move(sessions);
+        g_search_posting_index = std::move(postings);
+        return true;
     } catch (...) {
         return false;
     }
@@ -1633,13 +2285,15 @@ bool ensure_search_index_cache_current(const Config& cfg, const std::string& key
         if (!allow_full_build) return false;
         auto built = build_session_search_index(cfg, c);
         if (built.size != c.size || built.token_bloom.size() != kSearchIndexTokenBloomWords) return false;
+        ++g_search_index_full_builds;
         save_search_index_sidecar(cfg, key, built);
         std::lock_guard<std::mutex> lock(g_index_mutex);
         g_search_index_cache[key] = std::move(built);
+        ++g_search_index_cache_generation;
         return true;
     }
 
-    if (cached.size == c.size && std::abs(cached.mtime - c.mtime) < 0.000001) {
+    if (search_index_entry_is_current(cached, c)) {
         std::lock_guard<std::mutex> lock(g_index_mutex);
         g_search_index_cache[key] = std::move(cached);
         return true;
@@ -1648,9 +2302,11 @@ bool ensure_search_index_cache_current(const Config& cfg, const std::string& key
         if (!allow_full_build) return false;
         auto rebuilt = build_session_search_index(cfg, c);
         if (rebuilt.size != c.size || rebuilt.token_bloom.size() != kSearchIndexTokenBloomWords) return false;
+        ++g_search_index_rebuilds;
         save_search_index_sidecar(cfg, key, rebuilt);
         std::lock_guard<std::mutex> lock(g_index_mutex);
         g_search_index_cache[key] = std::move(rebuilt);
+        ++g_search_index_cache_generation;
         return true;
     }
 
@@ -1660,9 +2316,11 @@ bool ensure_search_index_cache_current(const Config& cfg, const std::string& key
         if (!allow_full_build) return false;
         auto rebuilt = build_session_search_index(cfg, c);
         if (rebuilt.size != c.size || rebuilt.token_bloom.size() != kSearchIndexTokenBloomWords) return false;
+        ++g_search_index_rebuilds;
         save_search_index_sidecar(cfg, key, rebuilt);
         std::lock_guard<std::mutex> lock(g_index_mutex);
         g_search_index_cache[key] = std::move(rebuilt);
+        ++g_search_index_cache_generation;
         return true;
     }
     auto sorted_additions = sorted_search_index_grams(additions);
@@ -1675,9 +2333,11 @@ bool ensure_search_index_cache_current(const Config& cfg, const std::string& key
     cached.token_bloom = std::move(updated_bloom);
     cached.size = c.size;
     cached.mtime = c.mtime;
+    ++g_search_index_incremental_updates;
     save_search_index_sidecar(cfg, key, cached);
     std::lock_guard<std::mutex> lock(g_index_mutex);
     g_search_index_cache[key] = std::move(cached);
+    ++g_search_index_cache_generation;
     return true;
 }
 
@@ -1691,30 +2351,42 @@ bool search_index_may_contain(const SearchIndexEntry& entry, const std::vector<s
     return true;
 }
 
-std::vector<Candidate> filter_candidates_by_search_index(const Config& cfg, const std::vector<Candidate>& files, const std::vector<std::uint32_t>& query_keys, const std::vector<std::uint64_t>& query_token_keys) {
+std::vector<Candidate> filter_candidates_by_search_index(const Config& cfg, const std::vector<Candidate>& files, const std::vector<std::uint32_t>& query_keys, const std::vector<std::uint64_t>& query_token_keys, const std::function<bool()>& cancelled = {}) {
     if ((query_keys.empty() && query_token_keys.empty()) || files.empty()) return files;
     load_search_index_catalog_once(cfg);
+    if (cancelled && cancelled()) return {};
+    const auto posting_index = query_keys.empty() ? std::shared_ptr<SearchPostingIndex>() : ensure_search_posting_index();
+    const auto posting_candidates = posting_index ? search_posting_candidate_keys(*posting_index, query_keys) : std::unordered_set<std::string>();
     std::vector<Candidate> out;
     out.reserve(files.size());
     for (auto c : files) {
+        if (cancelled && cancelled()) return {};
         c.size = file_size_or_zero(c.path);
         c.mtime = unix_mtime(c.path);
         const auto key = relative_key(c);
-        if (!ensure_search_index_cache_current(cfg, key, c, false)) {
+        if (posting_index && search_index_cache_generation() == posting_index->generation) {
+            const auto represented = posting_index->session_ids.find(key) != posting_index->session_ids.end();
+            if (represented && posting_candidates.find(key) == posting_candidates.end() &&
+                cached_search_index_entry_current(key, c)) {
+                continue;
+            }
+        }
+        bool may_contain = true;
+        if (cached_search_index_may_contain_current(key, c, query_keys, query_token_keys, may_contain)) {
+            if (may_contain) out.push_back(std::move(c));
+            continue;
+        }
+        SearchIndexEntry loaded;
+        if (!load_search_index_sidecar(cfg, key, loaded) || !search_index_entry_is_current(loaded, c)) {
             out.push_back(std::move(c));
             continue;
         }
-        SearchIndexEntry cached;
         {
             std::lock_guard<std::mutex> lock(g_index_mutex);
-            auto cache_it = g_search_index_cache.find(key);
-            if (cache_it == g_search_index_cache.end()) {
-                out.push_back(std::move(c));
-                continue;
-            }
-            cached = cache_it->second;
+            g_search_index_cache[key] = loaded;
+            ++g_search_index_cache_generation;
         }
-        if (search_index_may_contain(cached, query_keys, query_token_keys)) out.push_back(std::move(c));
+        if (search_index_may_contain(loaded, query_keys, query_token_keys)) out.push_back(std::move(c));
     }
     return out;
 }
@@ -1791,12 +2463,13 @@ std::optional<json> search_loaded_records(const std::shared_ptr<SearchEntry>& en
     return hits;
 }
 
-json search_snippets_uncached(const Config& cfg, const Candidate& c, const std::string& query, const std::string& qlower) {
+json search_snippets_uncached(const Config& cfg, const Candidate& c, const std::string& query, const std::string& qlower, const std::function<bool()>& cancelled = {}) {
     json hits = json::array();
     std::ifstream in(c.path, std::ios::binary);
     if (!in) return hits;
     std::string line;
     while (hits.size() < 3 && std::getline(in, line)) {
+        if (cancelled && cancelled()) return json::array();
         if (!line.empty() && line.back() == '\r') line.pop_back();
         if (find_ascii_case_insensitive(line, qlower) == std::string_view::npos) continue;
         auto obj = json::parse(line, nullptr, false);
@@ -1815,9 +2488,12 @@ json search_snippets_uncached(const Config& cfg, const Candidate& c, const std::
     return hits;
 }
 
-json search_snippets(const Config& cfg, const Candidate& c, std::shared_ptr<SearchEntry> entry, const std::string& query, const std::string& qlower) {
+json search_snippets(const Config& cfg, const Candidate& c, std::shared_ptr<SearchEntry> entry, const std::string& query, const std::string& qlower, const std::function<bool()>& cancelled = {}) {
+    if (cancelled && cancelled()) return json::array();
     if (auto loaded_hits = search_loaded_records(entry, query, qlower)) return *loaded_hits;
-    auto hits = search_snippets_uncached(cfg, c, query, qlower);
+    if (cancelled && cancelled()) return json::array();
+    auto hits = search_snippets_uncached(cfg, c, query, qlower, cancelled);
+    if (cancelled && cancelled()) return json::array();
     if (entry) {
         std::lock_guard<std::mutex> lock(entry->mutex);
         entry->hit_cache[qlower] = hits;
@@ -1850,7 +2526,7 @@ void start_search_warmup(const Config& cfg) {
                     });
                 }
                 for (auto& thread : threads) thread.join();
-                save_search_index_catalog(cfg);
+                save_search_index_catalog(cfg, files);
             }
         } catch (...) {
         }
@@ -2894,6 +3570,9 @@ void register_routes(httplib::Server& svr, const Config& cfg) {
             std::lock_guard<std::mutex> lock(g_index_mutex);
             g_index_cache.reset();
             g_search_index_cache.clear();
+            g_search_catalog_sessions.clear();
+            ++g_search_index_cache_generation;
+            g_search_posting_index.reset();
             g_search_catalog_loaded = false;
         }
         clear_candidate_cache(cfg);
@@ -2918,6 +3597,20 @@ void register_routes(httplib::Server& svr, const Config& cfg) {
     });
 
     svr.Get("/api/search", [&](const httplib::Request& req, httplib::Response& res) {
+        const auto search_generation = g_search_generation.fetch_add(1) + 1;
+        std::atomic_bool cancelled_flag{false};
+        auto cancelled = [&]() {
+            if (cancelled_flag.load()) return true;
+            if (g_search_generation.load() != search_generation || req.is_connection_closed()) {
+                cancelled_flag.store(true);
+                return true;
+            }
+            return false;
+        };
+        auto cancelled_response = [&]() {
+            ++g_search_cancelled;
+            json_response(res, {{"ok", false}, {"cancelled", true}}, 499);
+        };
         const auto query = trim(req.has_param("q") ? url_decode(req.get_param_value("q")) : "");
         if (query.empty()) {
             json_response(res, {{"results", json::array()}});
@@ -2928,7 +3621,11 @@ void register_routes(httplib::Server& svr, const Config& cfg) {
         const bool raw_search = req.has_param("raw") && req.get_param_value("raw") == "1";
         const auto query_keys = raw_search ? std::vector<std::uint32_t>() : search_query_index_keys(qlower);
         const auto query_token_keys = raw_search ? std::vector<std::uint64_t>() : search_query_token_index_keys(qlower);
-        const auto search_files = raw_search ? files : filter_candidates_by_search_index(cfg, files, query_keys, query_token_keys);
+        const auto search_files = raw_search ? files : filter_candidates_by_search_index(cfg, files, query_keys, query_token_keys, cancelled);
+        if (cancelled()) {
+            cancelled_response();
+            return;
+        }
         json results = json::array();
         std::vector<json> result_items(search_files.size());
         std::atomic_size_t next{0};
@@ -2938,10 +3635,12 @@ void register_routes(httplib::Server& svr, const Config& cfg) {
             threads.emplace_back([&, w] {
                 (void)w;
                 while (true) {
+                    if (cancelled()) break;
                     const auto i = next.fetch_add(1);
                     if (i >= search_files.size()) break;
                     auto entry = ensure_search_entry(search_files[i]);
-                    auto hits = search_snippets(cfg, search_files[i], entry, query, qlower);
+                    auto hits = search_snippets(cfg, search_files[i], entry, query, qlower, cancelled);
+                    if (cancelled()) break;
                     if (!hits.empty()) {
                         result_items[i] = {{"project", search_files[i].project}, {"sid", search_files[i].sid}, {"mtime", search_files[i].mtime}, {"hits", hits}};
                     }
@@ -2949,6 +3648,10 @@ void register_routes(httplib::Server& svr, const Config& cfg) {
             });
         }
         for (auto& thread : threads) thread.join();
+        if (cancelled()) {
+            cancelled_response();
+            return;
+        }
 
         for (auto& item : result_items) {
             if (!item.is_null()) results.push_back(std::move(item));
@@ -2958,6 +3661,25 @@ void register_routes(httplib::Server& svr, const Config& cfg) {
                    (b["mtime"].is_number() ? b["mtime"].get<double>() : 0.0);
         });
         json_response(res, {{"results", results}, {"searched", search_files.size()}, {"total", files.size()}});
+    });
+
+    svr.Get("/api/search-index-stats", [&](const httplib::Request&, httplib::Response& res) {
+        std::lock_guard<std::mutex> lock(g_index_mutex);
+        const auto posting_terms = g_search_posting_index ? g_search_posting_index->gram_postings.size() : 0;
+        const auto posting_sessions = g_search_posting_index ? g_search_posting_index->session_keys.size() : 0;
+        json_response(res, {
+            {"cacheEntries", g_search_index_cache.size()},
+            {"cacheGeneration", g_search_index_cache_generation},
+            {"catalogLoaded", g_search_catalog_loaded},
+            {"catalogSessions", g_search_catalog_sessions.size()},
+            {"postingTerms", posting_terms},
+            {"postingSessions", posting_sessions},
+            {"fullBuilds", g_search_index_full_builds.load()},
+            {"incrementalUpdates", g_search_index_incremental_updates.load()},
+            {"rebuilds", g_search_index_rebuilds.load()},
+            {"searchGeneration", g_search_generation.load()},
+            {"cancelledSearches", g_search_cancelled.load()}
+        });
     });
 
     svr.Get(R"(/api/export/([^/]+)/([^/]+))", [&](const httplib::Request& req, httplib::Response& res) {
@@ -3056,6 +3778,22 @@ void register_routes(httplib::Server& svr, const Config& cfg) {
         if (incoming.contains("proxyUrl")) settings["proxyUrl"] = field_string(incoming, "proxyUrl");
         save_manager_settings(cfg, settings);
         json_response(res, {{"ok", true}, {"settings", load_manager_settings(cfg)}});
+    });
+
+    svr.Get("/api/mcp", [&](const httplib::Request&, httplib::Response& res) {
+        json_response(res, list_mcp_servers(cfg));
+    });
+
+    svr.Post("/api/mcp/toggle", [&](const httplib::Request& req, httplib::Response& res) {
+        const auto body = parse_json_body(req);
+        const auto name = field_string(body, "name");
+        const auto enabled = field_bool(body, "enabled");
+        std::string error;
+        if (!set_mcp_enabled(cfg, name, enabled, error)) {
+            error_response(res, 400, error.empty() ? "failed to update MCP server" : error);
+            return;
+        }
+        json_response(res, list_mcp_servers(cfg));
     });
 
     svr.Post("/api/new-chat", [&](const httplib::Request&, httplib::Response& res) {

@@ -1819,6 +1819,10 @@ input, textarea {
   flex-shrink: 0;
 }
 .toggle.on { background: var(--accent); }
+.toggle.disabled {
+  opacity: 0.55;
+  cursor: default;
+}
 .toggle::after {
   content: '';
   position: absolute;
@@ -1830,6 +1834,40 @@ input, textarea {
   box-shadow: 0 1px 2px oklch(0% 0 0 / 0.2);
 }
 .toggle.on::after { transform: translateX(16px); }
+
+.mcp-row {
+  align-items: flex-start;
+}
+.mcp-name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.mcp-pill {
+  display: inline-flex;
+  align-items: center;
+  height: 18px;
+  padding: 0 6px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: var(--bg-sunk);
+  color: var(--ink-3);
+  font-size: 10.5px;
+  font-weight: 500;
+}
+.mcp-pill.on {
+  color: var(--accent-ink);
+  border-color: var(--accent-soft);
+  background: var(--accent-soft);
+}
+.mcp-target {
+  max-width: min(640px, 56vw);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono);
+}
 
 /* Theme swatches */
 .theme-picker {
