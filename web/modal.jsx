@@ -17,109 +17,15 @@
     else queue.push(entry);
   });
 
-  // One-shot: probe /api/auth-status, offer re-login if bad, poll until
-  // the CLI flow completes, then reload the page. Used by the sidebar's
-  // "刷新数据" button so the refresh also repairs OAuth.
   window.refreshAll = async () => {
-    let status;
-    try { status = await (await fetch('/api/auth-status')).json(); }
-    catch { status = null; }
-
-    if (status && status.ok) {
-      window.location.reload();
-      return;
-    }
-
-    const reason = (status && status.reason) || 'unknown';
-    const msg = reason === 'expired'        ? 'Claude 登录已过期。'
-             : reason === 'expiring'        ? 'Claude 登录即将过期。'
-             : reason === 'no_credentials'  ? '未找到 Claude 登录凭证。'
-             : 'Claude 登录需要刷新。';
-    const ok = await window.dialog.confirm(
-      `${msg}\n现在打开终端完成登录,完成后会自动刷新数据。`,
-      {title: '刷新数据', okLabel: '打开登录终端'});
-    if (!ok) {
-      // User declined — still reload the scan, they can re-login later.
-      window.location.reload();
-      return;
-    }
-
     try {
-      const r = await fetch('/api/claude-login', {method:'POST'});
-      const d = await r.json();
-      if (!d.ok) {
-        await window.dialog.alert('启动登录失败: ' + (d.error || '未知'),
-          {title:'启动失败', danger:true});
-        return;
-      }
+      const r = await fetch('/api/refresh', {method:'POST'});
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok || d.ok === false) throw new Error(d.error || `HTTP ${r.status}`);
     } catch (e) {
-      await window.dialog.alert('启动登录失败: ' + e, {title:'启动失败', danger:true});
-      return;
+      console.warn('Failed to refresh session index', e);
     }
-
-    // Show a self-dismissing status dialog and poll every 2s until auth is OK
-    // or the user hits Cancel. Max 5 minutes.
-    let cancelled = false;
-    const waitSpec = {
-      kind: 'alert',
-      title: '等待登录完成…',
-      message: '请在刚打开的终端里完成 `claude /login`。\n完成后界面会自动刷新。',
-      okLabel: '取消',
-      _resolve: () => { cancelled = true; },
-      _done: false,
-    };
-    if (notify) notify(waitSpec); else queue.push(waitSpec);
-
-    const deadline = Date.now() + 5 * 60 * 1000;
-    while (!cancelled && Date.now() < deadline) {
-      await new Promise(r => setTimeout(r, 2000));
-      try {
-        const s = await (await fetch('/api/auth-status')).json();
-        if (s && s.ok) {
-          if (!waitSpec._done) {
-            waitSpec._done = true;
-            if (notify) notify(null); // close dialog
-          }
-          window.location.reload();
-          return;
-        }
-      } catch {}
-    }
-    if (!waitSpec._done) {
-      waitSpec._done = true;
-      if (notify) notify(null);
-    }
-    if (!cancelled) {
-      await window.dialog.alert('等待超时,请确认已完成登录后再手动刷新。',
-        {title:'等待超时'});
-    }
-  };
-
-  // Handle a 401 `{needsLogin: true}` response by offering to re-login.
-  // Returns true iff the caller should abort (login flow was launched OR user
-  // cancelled). Returns false when the response was fine (no login needed).
-  window.handleAuthGate = async (responseJson) => {
-    if (!responseJson || !responseJson.needsLogin) return false;
-    const ok = await window.dialog.confirm(
-      `${responseJson.error || 'Claude 登录已过期'}\n现在打开终端重新登录?`,
-      {title: 'Claude 登录已过期', okLabel: '重新登录', danger: false});
-    if (ok) {
-      try {
-        const r = await fetch('/api/claude-login', {method:'POST'});
-        const d = await r.json();
-        if (!d.ok) {
-          await window.dialog.alert('启动登录失败: ' + (d.error || '未知'),
-            {title:'启动失败', danger:true});
-        } else {
-          await window.dialog.alert(
-            '已打开终端窗口。完成 `claude /login` 后,回到这里再次点击操作即可。',
-            {title:'请在新终端中完成登录'});
-        }
-      } catch (e) {
-        await window.dialog.alert('启动登录失败: ' + e, {title:'启动失败', danger:true});
-      }
-    }
-    return true;
+    window.location.reload();
   };
 
   window.dialog = {
