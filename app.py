@@ -40,7 +40,7 @@ BACKUP_SESSIONS_DIR = CODEX_BACKUP_HOME / "sessions"
 BACKUP_ARCHIVED_SESSIONS_DIR = CODEX_BACKUP_HOME / "archived_sessions"
 NEW_CHAT_EXE_NAME = "Codex.exe"
 INDEX_FILE = Path.home() / ".codex_conv_manager" / "index.json"
-INDEX_VERSION = 2
+INDEX_VERSION = 3
 USAGE_ROWS_VERSION = 2
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("CODEX_MANAGER_PORT", "8766"))
@@ -436,8 +436,11 @@ def _repair_tool_output_text(text: str) -> str:
 
 def _is_internal_codex_text(text: str) -> bool:
     s = (text or "").strip()
+    first_line = s.splitlines()[0].strip().lower() if s else ""
     return (
         not s
+        or first_line.startswith("# agents.md instructions for ")
+        or first_line.startswith("agents.md instructions for ")
         or s.startswith("<environment_context>")
         or s.startswith("<turn_aborted>")
         or s.startswith("<permissions instructions>")
