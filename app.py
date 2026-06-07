@@ -31,7 +31,7 @@ for _v in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
 NEW_CHAT_EXE_NAME = "Claude.exe"
 INDEX_FILE = Path.home() / ".claude_manager" / "index.json"
-INDEX_VERSION = 1
+INDEX_VERSION = 2
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("CLAUDE_MANAGER_PORT", "8765"))
 CLAUDE_RESUME_PERMISSION_ARGS = [
@@ -193,6 +193,20 @@ def _extract_text(content: Any) -> str:
     return ""
 
 
+def _is_internal_instruction_text(text: str) -> bool:
+    s = (text or "").strip()
+    first_line = s.splitlines()[0].strip().lower() if s else ""
+    return (
+        not s
+        or first_line.startswith("# agents.md instructions for ")
+        or first_line.startswith("agents.md instructions for ")
+        or s.startswith("<environment_context>")
+        or s.startswith("<permissions instructions>")
+        or s.startswith("<collaboration_mode>")
+        or s.startswith("<skills_instructions>")
+    )
+
+
 def _scan_session(project: str, path: Path) -> tuple[dict, list]:
     """Walk JSONL once; return (summary_dict, cost_rows).
 
@@ -228,7 +242,7 @@ def _scan_session(project: str, path: Path) -> tuple[dict, list]:
             is_tool_result = bool(msg.get("content") and isinstance(msg["content"], list) and
                                   any(isinstance(c, dict) and c.get("type") == "tool_result" for c in msg["content"]))
             cleaned = _clean_user_text(text) if text else ""
-            if cleaned and not is_meta and not is_tool_result:
+            if cleaned and not is_meta and not is_tool_result and not _is_internal_instruction_text(cleaned):
                 if not first_user_text:
                     first_user_text = cleaned[:200]
                 user_count += 1
